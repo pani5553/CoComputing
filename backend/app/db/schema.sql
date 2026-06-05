@@ -1,0 +1,8 @@
+-- =============================================================================
+-- Co-Computing — Schema
+-- Este fichero es equivalente a migrations/001_schema.sql
+-- Para aplicar el schema, ejecutar migrations/001_schema.sql en Supabase SQL Editor.
+-- =============================================================================
+-- Ver: migrations/001_schema.sql en la raiz del repositorio
+-- Contenido identico mantenido en la migracion numerada para control de versiones.
+-- =============================================================================
