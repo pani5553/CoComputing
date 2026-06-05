@@ -22,27 +22,6 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
-# Constantes también disponibles desde conftest.py raíz via fixtures
-# Las definimos aquí para usarlas en datos inline de prueba
-import sys as _sys
-import os as _os
-_tests_dir = _os.path.dirname(_os.path.abspath(__file__))
-if _tests_dir not in _sys.path:
-    _sys.path.insert(0, _tests_dir)
-
-# Importamos directamente del módulo conftest de tests/ (no del backend)
-import importlib.util as _ilu
-_spec = _ilu.spec_from_file_location(
-    "root_conftest",
-    _os.path.join(_tests_dir, "conftest.py"),
-)
-_root_conftest = _ilu.module_from_spec(_spec)
-_spec.loader.exec_module(_root_conftest)
-ASSIGNMENT_ID = _root_conftest.ASSIGNMENT_ID
-NOW = _root_conftest.NOW
-PROVIDER_ID = _root_conftest.PROVIDER_ID
-TASK_ID = _root_conftest.TASK_ID
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # GET /tasks/
@@ -64,7 +43,7 @@ def test_list_tasks_returns_available_tasks(
     assert data["count"] == 1
     assert len(data["tasks"]) == 1
     task = data["tasks"][0]
-    assert task["id"] == TASK_ID
+    assert task["id"] == mock_task["id"]
     assert task["title"] == "Entrenamiento ML — ResNet-50 CIFAR-100"
     assert task["status"] == "disponible"
     assert "stages" in task
@@ -97,15 +76,12 @@ def test_list_tasks_filter_by_difficulty(
     client: TestClient, mock_task: dict
 ) -> None:
     """
-    US-06 CA-1 / US-24 CA-2: Filtro por dificultad pasa correctamente el parámetro.
+    US-06 CA-1 / US-24 CA-2: Filtro por dificultad devuelve tareas correctas.
     """
-    with patch("app.routers.tasks.task_queries.get_tasks", return_value=[mock_task]) as mock_get:
+    with patch("app.routers.tasks.task_queries.get_tasks", return_value=[mock_task]):
         response = client.get("/tasks/?difficulty=dificil")
 
     assert response.status_code == 200
-    # Verificar que se llamó con la lista correcta
-    call_kwargs = mock_get.call_args[1] if mock_get.call_args[1] else mock_get.call_args[0][0] if mock_get.call_args[0] else {}
-    # El router convierte el string en lista
     assert response.json()["count"] == 1
 
 
@@ -113,7 +89,7 @@ def test_list_tasks_filter_by_hardware(
     client: TestClient, mock_task: dict
 ) -> None:
     """
-    US-06 CA-2 / US-24 CA-2: Filtro por hardware pasa correctamente.
+    US-06 CA-2 / US-24 CA-2: Filtro por hardware devuelve tareas correctas.
     """
     with patch("app.routers.tasks.task_queries.get_tasks", return_value=[mock_task]):
         response = client.get("/tasks/?hardware=gpu")
@@ -139,9 +115,9 @@ def test_list_tasks_multiple_difficulty_values(
     client: TestClient, mock_task: dict
 ) -> None:
     """
-    US-06 CA-1: Múltiples valores de dificultad separados por coma.
+    US-06 CA-1: Múltiples valores de dificultad separados por coma son aceptados.
     """
-    with patch("app.routers.tasks.task_queries.get_tasks", return_value=[mock_task]) as mock_get:
+    with patch("app.routers.tasks.task_queries.get_tasks", return_value=[mock_task]):
         response = client.get("/tasks/?difficulty=facil,dificil")
 
     assert response.status_code == 200
@@ -168,22 +144,25 @@ def test_list_tasks_min_reward_zero_rejected(client: TestClient) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def test_get_my_history_returns_assignment_list(client: TestClient) -> None:
+def test_get_my_history_returns_assignment_list(
+    client: TestClient, mock_task: dict, mock_assignment: dict
+) -> None:
     """
     US-24 CA-8: Historial del proveedor autenticado devuelve lista de asignaciones.
     """
+    now = datetime(2026, 6, 5, 14, 0, 0, tzinfo=timezone.utc)
     history_rows = [
         {
-            "id": ASSIGNMENT_ID,
-            "task_id": TASK_ID,
+            "id": mock_assignment["id"],
+            "task_id": mock_task["id"],
             "task_title": "Entrenamiento ML — ResNet-50 CIFAR-100",
             "task_type": "entrenamiento_ml",
             "status": "completada",
             "reward_paid": 5.00,
             "trust_delta": 1.20,
-            "accepted_at": NOW,
-            "started_at": NOW,
-            "completed_at": NOW,
+            "accepted_at": now,
+            "started_at": now,
+            "completed_at": now,
         }
     ]
     with patch("app.routers.tasks.task_queries.get_provider_assignments_history", return_value=history_rows):
@@ -221,22 +200,25 @@ def test_get_my_history_requires_authentication(
     assert response.status_code == 401
 
 
-def test_get_my_history_includes_failed_assignments(client: TestClient) -> None:
+def test_get_my_history_includes_failed_assignments(
+    client: TestClient, mock_task: dict
+) -> None:
     """
     El historial incluye asignaciones fallidas con reward_paid=null y trust_delta negativo.
     """
+    now = datetime(2026, 6, 5, 14, 0, 0, tzinfo=timezone.utc)
     history_rows = [
         {
             "id": str(uuid.uuid4()),
-            "task_id": TASK_ID,
+            "task_id": mock_task["id"],
             "task_title": "Simulación de fluidos",
             "task_type": "simulacion_fisica",
             "status": "fallida",
             "reward_paid": None,
             "trust_delta": -2.50,
-            "accepted_at": NOW,
-            "started_at": NOW,
-            "completed_at": NOW,
+            "accepted_at": now,
+            "started_at": now,
+            "completed_at": now,
         }
     ]
     with patch("app.routers.tasks.task_queries.get_provider_assignments_history", return_value=history_rows):
@@ -264,11 +246,11 @@ def test_get_task_by_id_returns_full_detail(
         patch("app.routers.tasks.task_queries.get_task_by_id", return_value=mock_task),
         patch("app.routers.tasks.task_queries.get_active_assignment_for_provider_task", return_value=None),
     ):
-        response = client.get(f"/tasks/{TASK_ID}")
+        response = client.get(f"/tasks/{mock_task['id']}")
 
     assert response.status_code == 200
     data = response.json()
-    assert data["id"] == TASK_ID
+    assert data["id"] == mock_task["id"]
     assert data["title"] == "Entrenamiento ML — ResNet-50 CIFAR-100"
     assert data["reward"] == 5.00
     assert data["difficulty"] == "dificil"
@@ -287,7 +269,7 @@ def test_get_task_by_id_includes_active_assignment(
         patch("app.routers.tasks.task_queries.get_task_by_id", return_value=mock_task),
         patch("app.routers.tasks.task_queries.get_active_assignment_for_provider_task", return_value=mock_assignment),
     ):
-        response = client.get(f"/tasks/{TASK_ID}")
+        response = client.get(f"/tasks/{mock_task['id']}")
 
     assert response.status_code == 200
     data = response.json()
@@ -310,7 +292,7 @@ def test_get_task_requires_authentication(unauthenticated_client: TestClient) ->
     """
     GET /tasks/{id} sin token devuelve 401.
     """
-    response = unauthenticated_client.get(f"/tasks/{TASK_ID}")
+    response = unauthenticated_client.get(f"/tasks/{uuid.uuid4()}")
     assert response.status_code == 401
 
 
@@ -319,53 +301,58 @@ def test_get_task_requires_authentication(unauthenticated_client: TestClient) ->
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def test_get_progress_in_processing_returns_progress_data(client: TestClient) -> None:
+def test_get_progress_in_processing_returns_progress_data(
+    client: TestClient, mock_provider: dict, mock_task: dict, mock_assignment: dict
+) -> None:
     """
     US-14 CA-1 / US-24: Asignación en procesamiento devuelve progress entre 0 y 99.
     También contiene: current_stage_index, stages, can_complete.
     """
+    now = datetime(2026, 6, 5, 14, 0, 0, tzinfo=timezone.utc)
     row = {
-        "assignment_id": ASSIGNMENT_ID,
-        "task_id": TASK_ID,
+        "assignment_id": mock_assignment["id"],
+        "task_id": mock_task["id"],
         "task_title": "Entrenamiento ML — ResNet-50 CIFAR-100",
         "status": "procesando",
-        "started_at": NOW,
+        "started_at": now,
         "completed_at": None,
-        "provider_id": PROVIDER_ID,
+        "provider_id": mock_provider["id"],  # mismo proveedor que el autenticado
         "stages": ["Etapa 1", "Etapa 2", "Etapa 3", "Etapa 4", "Etapa 5"],
         "duration_max": 90,
     }
     with patch("app.routers.tasks.task_queries.get_assignment_with_task", return_value=row):
-        response = client.get(f"/tasks/assignments/{ASSIGNMENT_ID}/progress")
+        response = client.get(f"/tasks/assignments/{mock_assignment['id']}/progress")
 
     assert response.status_code == 200
     data = response.json()
-    assert data["assignment_id"] == ASSIGNMENT_ID
+    assert data["assignment_id"] == mock_assignment["id"]
     assert "progress" in data
-    assert 0.0 <= data["progress"] <= 99.0, "El progreso debe estar entre 0 y 99 (nunca llega a 100 automáticamente)"
+    assert 0.0 <= data["progress"] <= 99.0, "El progreso debe estar entre 0 y 99 (techo en 99)"
     assert "current_stage_index" in data
     assert "stages" in data
     assert "can_complete" in data
     assert isinstance(data["can_complete"], bool)
 
 
-def test_get_progress_not_yet_started_returns_zero(client: TestClient) -> None:
+def test_get_progress_not_yet_started_returns_zero(
+    client: TestClient, mock_provider: dict, mock_task: dict, mock_assignment: dict
+) -> None:
     """
     US-14 CA-4: Asignación en estado 'aceptada' (no iniciada) devuelve progress=0.
     """
     row = {
-        "assignment_id": ASSIGNMENT_ID,
-        "task_id": TASK_ID,
+        "assignment_id": mock_assignment["id"],
+        "task_id": mock_task["id"],
         "task_title": "Test Task",
         "status": "aceptada",
         "started_at": None,
         "completed_at": None,
-        "provider_id": PROVIDER_ID,
+        "provider_id": mock_provider["id"],
         "stages": ["Etapa 1", "Etapa 2", "Etapa 3"],
         "duration_max": 60,
     }
     with patch("app.routers.tasks.task_queries.get_assignment_with_task", return_value=row):
-        response = client.get(f"/tasks/assignments/{ASSIGNMENT_ID}/progress")
+        response = client.get(f"/tasks/assignments/{mock_assignment['id']}/progress")
 
     assert response.status_code == 200
     data = response.json()
@@ -374,25 +361,28 @@ def test_get_progress_not_yet_started_returns_zero(client: TestClient) -> None:
     assert data["started_at"] is None
 
 
-def test_get_progress_forbidden_for_other_provider(client: TestClient) -> None:
+def test_get_progress_forbidden_for_other_provider(
+    client: TestClient, mock_task: dict, mock_assignment: dict
+) -> None:
     """
     US-14 CA-3 / US-24 CA-9: Otro proveedor no puede ver el progreso de una asignación ajena.
     Devuelve 403.
     """
     other_provider_id = str(uuid.uuid4())
+    now = datetime(2026, 6, 5, 14, 0, 0, tzinfo=timezone.utc)
     row = {
-        "assignment_id": ASSIGNMENT_ID,
-        "task_id": TASK_ID,
+        "assignment_id": mock_assignment["id"],
+        "task_id": mock_task["id"],
         "task_title": "Test Task",
         "status": "procesando",
-        "started_at": NOW,
+        "started_at": now,
         "completed_at": None,
-        "provider_id": other_provider_id,
+        "provider_id": other_provider_id,  # proveedor diferente al autenticado
         "stages": ["Etapa 1", "Etapa 2"],
         "duration_max": 90,
     }
     with patch("app.routers.tasks.task_queries.get_assignment_with_task", return_value=row):
-        response = client.get(f"/tasks/assignments/{ASSIGNMENT_ID}/progress")
+        response = client.get(f"/tasks/assignments/{mock_assignment['id']}/progress")
 
     assert response.status_code == 403
     assert "permiso" in response.json()["detail"].lower()
@@ -409,23 +399,26 @@ def test_get_progress_not_found_returns_404(client: TestClient) -> None:
     assert response.json()["detail"] == "Asignación no encontrada"
 
 
-def test_get_progress_terminal_state_returns_100(client: TestClient) -> None:
+def test_get_progress_terminal_state_returns_100(
+    client: TestClient, mock_provider: dict, mock_task: dict, mock_assignment: dict
+) -> None:
     """
     US-14 CA-4: Asignación completada devuelve progress=100.
     """
+    now = datetime(2026, 6, 5, 14, 0, 0, tzinfo=timezone.utc)
     row = {
-        "assignment_id": ASSIGNMENT_ID,
-        "task_id": TASK_ID,
+        "assignment_id": mock_assignment["id"],
+        "task_id": mock_task["id"],
         "task_title": "Test Task",
         "status": "completada",
-        "started_at": NOW,
-        "completed_at": NOW,
-        "provider_id": PROVIDER_ID,
+        "started_at": now,
+        "completed_at": now,
+        "provider_id": mock_provider["id"],
         "stages": ["Etapa 1", "Etapa 2", "Etapa 3"],
         "duration_max": 60,
     }
     with patch("app.routers.tasks.task_queries.get_assignment_with_task", return_value=row):
-        response = client.get(f"/tasks/assignments/{ASSIGNMENT_ID}/progress")
+        response = client.get(f"/tasks/assignments/{mock_assignment['id']}/progress")
 
     assert response.status_code == 200
     data = response.json()
@@ -433,11 +426,13 @@ def test_get_progress_terminal_state_returns_100(client: TestClient) -> None:
     assert data["can_complete"] is False
 
 
-def test_get_progress_requires_authentication(unauthenticated_client: TestClient) -> None:
+def test_get_progress_requires_authentication(
+    unauthenticated_client: TestClient,
+) -> None:
     """
     GET /tasks/assignments/{id}/progress sin token devuelve 401.
     """
-    response = unauthenticated_client.get(f"/tasks/assignments/{ASSIGNMENT_ID}/progress")
+    response = unauthenticated_client.get(f"/tasks/assignments/{uuid.uuid4()}/progress")
     assert response.status_code == 401
 
 
@@ -459,11 +454,11 @@ def test_accept_task_success_returns_201(
         patch("app.services.task_lifecycle.task_queries.decrement_slots_atomic", return_value=True),
         patch("app.services.task_lifecycle.task_queries.create_assignment", return_value=mock_assignment),
     ):
-        response = client.post(f"/tasks/{TASK_ID}/accept")
+        response = client.post(f"/tasks/{mock_task['id']}/accept")
 
     assert response.status_code == 201
     data = response.json()
-    assert data["task_id"] == TASK_ID
+    assert data["task_id"] == mock_task["id"]
     assert data["status"] == "aceptada"
     assert data["reward_paid"] is None
     assert data["trust_delta"] is None
@@ -475,7 +470,7 @@ def test_accept_task_without_authentication_returns_401(
     """
     US-24 CA-4: POST /tasks/{id}/accept sin token devuelve 401.
     """
-    response = unauthenticated_client.post(f"/tasks/{TASK_ID}/accept")
+    response = unauthenticated_client.post(f"/tasks/{uuid.uuid4()}/accept")
     assert response.status_code == 401
 
 
@@ -489,7 +484,7 @@ def test_accept_task_already_active_returns_400(
         patch("app.services.task_lifecycle.task_queries.get_task_by_id", return_value=mock_task),
         patch("app.services.task_lifecycle.task_queries.get_active_assignment_for_provider_task", return_value=mock_assignment),
     ):
-        response = client.post(f"/tasks/{TASK_ID}/accept")
+        response = client.post(f"/tasks/{mock_task['id']}/accept")
 
     assert response.status_code == 400
     assert "activa" in response.json()["detail"]
@@ -506,7 +501,7 @@ def test_accept_task_no_slots_returns_400(
         patch("app.services.task_lifecycle.task_queries.get_active_assignment_for_provider_task", return_value=None),
         patch("app.services.task_lifecycle.task_queries.decrement_slots_atomic", return_value=False),
     ):
-        response = client.post(f"/tasks/{TASK_ID}/accept")
+        response = client.post(f"/tasks/{mock_task['id']}/accept")
 
     assert response.status_code == 400
     assert "plazas" in response.json()["detail"]
@@ -534,22 +529,23 @@ def test_start_task_success_returns_200_with_stages(
     US-10 CA-1 / US-24 CA-5: Iniciar tarea aceptada devuelve 200 con assignment_id,
     stages, stages_count y duration_max_seconds.
     """
-    updated_assignment = {**mock_assignment, "status": "procesando", "started_at": NOW}
+    now = datetime(2026, 6, 5, 14, 0, 0, tzinfo=timezone.utc)
+    updated_assignment = {**mock_assignment, "status": "procesando", "started_at": now}
     with (
         patch("app.services.task_lifecycle.task_queries.get_task_by_id", return_value=mock_task),
         patch("app.services.task_lifecycle.task_queries.get_active_assignment_for_provider_task", return_value=mock_assignment),
         patch("app.services.task_lifecycle.task_queries.update_assignment_status", return_value=updated_assignment),
     ):
-        response = client.post(f"/tasks/{TASK_ID}/start")
+        response = client.post(f"/tasks/{mock_task['id']}/start")
 
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "procesando"
-    assert data["assignment_id"] == ASSIGNMENT_ID
-    assert data["task_id"] == TASK_ID
-    assert len(data["stages"]) == 5
-    assert data["stages_count"] == 5
-    assert data["duration_max_seconds"] == 90 * 60
+    assert data["assignment_id"] == mock_assignment["id"]
+    assert data["task_id"] == mock_task["id"]
+    assert len(data["stages"]) == len(mock_task["stages"])
+    assert data["stages_count"] == len(mock_task["stages"])
+    assert data["duration_max_seconds"] == mock_task["duration_max"] * 60
 
 
 def test_start_task_wrong_state_returns_400(
@@ -563,7 +559,7 @@ def test_start_task_wrong_state_returns_400(
         patch("app.services.task_lifecycle.task_queries.get_task_by_id", return_value=mock_task),
         patch("app.services.task_lifecycle.task_queries.get_active_assignment_for_provider_task", return_value=processing_assignment),
     ):
-        response = client.post(f"/tasks/{TASK_ID}/start")
+        response = client.post(f"/tasks/{mock_task['id']}/start")
 
     assert response.status_code == 400
     assert "aceptado" in response.json()["detail"]
@@ -579,7 +575,7 @@ def test_start_task_no_active_assignment_returns_404(
         patch("app.services.task_lifecycle.task_queries.get_task_by_id", return_value=mock_task),
         patch("app.services.task_lifecycle.task_queries.get_active_assignment_for_provider_task", return_value=None),
     ):
-        response = client.post(f"/tasks/{TASK_ID}/start")
+        response = client.post(f"/tasks/{mock_task['id']}/start")
 
     assert response.status_code == 404
 
@@ -596,9 +592,10 @@ def test_complete_task_success_returns_200_with_reward_and_trust(
     US-11 CA-1 / US-24 CA-6: Completar tarea en procesamiento devuelve 200 con
     reward_paid, trust_delta, new_trust_score y new_rank.
     """
-    processing_assignment = {**mock_assignment, "status": "procesando", "started_at": NOW}
-    completed_assignment = {**processing_assignment, "status": "completada", "completed_at": NOW}
-    updated_provider = {**mock_provider, "tasks_completed": 6}
+    now = datetime(2026, 6, 5, 14, 0, 0, tzinfo=timezone.utc)
+    processing_assignment = {**mock_assignment, "status": "procesando", "started_at": now}
+    completed_assignment = {**processing_assignment, "status": "completada", "completed_at": now}
+    updated_provider = {**mock_provider, "tasks_completed": mock_provider["tasks_completed"] + 1}
 
     with (
         patch("app.services.task_lifecycle.task_queries.get_task_by_id", return_value=mock_task),
@@ -610,12 +607,12 @@ def test_complete_task_success_returns_200_with_reward_and_trust(
         patch("app.services.task_lifecycle.get_provider_by_id", return_value=mock_provider),
         patch("app.services.task_lifecycle.update_provider", return_value=updated_provider),
     ):
-        response = client.post(f"/tasks/{TASK_ID}/complete")
+        response = client.post(f"/tasks/{mock_task['id']}/complete")
 
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "completada"
-    assert data["reward_paid"] == 5.00
+    assert data["reward_paid"] == mock_task["reward"]
     assert "trust_delta" in data
     assert "new_trust_score" in data
     assert "new_rank" in data
@@ -632,7 +629,7 @@ def test_complete_task_wrong_state_returns_400(
         patch("app.services.task_lifecycle.task_queries.get_task_by_id", return_value=mock_task),
         patch("app.services.task_lifecycle.task_queries.get_active_assignment_for_provider_task", return_value=mock_assignment),
     ):
-        response = client.post(f"/tasks/{TASK_ID}/complete")
+        response = client.post(f"/tasks/{mock_task['id']}/complete")
 
     assert response.status_code == 400
     assert "procesamiento" in response.json()["detail"]
@@ -648,7 +645,7 @@ def test_complete_task_no_active_assignment_returns_404(
         patch("app.services.task_lifecycle.task_queries.get_task_by_id", return_value=mock_task),
         patch("app.services.task_lifecycle.task_queries.get_active_assignment_for_provider_task", return_value=None),
     ):
-        response = client.post(f"/tasks/{TASK_ID}/complete")
+        response = client.post(f"/tasks/{mock_task['id']}/complete")
 
     assert response.status_code == 404
 
@@ -657,7 +654,7 @@ def test_complete_task_requires_authentication(unauthenticated_client: TestClien
     """
     POST /tasks/{id}/complete sin token devuelve 401.
     """
-    response = unauthenticated_client.post(f"/tasks/{TASK_ID}/complete")
+    response = unauthenticated_client.post(f"/tasks/{uuid.uuid4()}/complete")
     assert response.status_code == 401
 
 
@@ -673,8 +670,9 @@ def test_fail_task_success_returns_200_no_reward(
     US-12 CA-1 / US-24 CA-7: Fallar tarea en procesamiento devuelve 200 con
     reward_paid=null y trust_delta negativo.
     """
-    processing_assignment = {**mock_assignment, "status": "procesando", "started_at": NOW}
-    failed_assignment = {**processing_assignment, "status": "fallida", "completed_at": NOW}
+    now = datetime(2026, 6, 5, 14, 0, 0, tzinfo=timezone.utc)
+    processing_assignment = {**mock_assignment, "status": "procesando", "started_at": now}
+    failed_assignment = {**processing_assignment, "status": "fallida", "completed_at": now}
 
     with (
         patch("app.services.task_lifecycle.task_queries.get_task_by_id", return_value=mock_task),
@@ -684,7 +682,7 @@ def test_fail_task_success_returns_200_no_reward(
         patch("app.services.task_lifecycle.get_provider_by_id", return_value=mock_provider),
         patch("app.services.task_lifecycle.update_provider", return_value=mock_provider),
     ):
-        response = client.post(f"/tasks/{TASK_ID}/fail")
+        response = client.post(f"/tasks/{mock_task['id']}/fail")
 
     assert response.status_code == 200
     data = response.json()
@@ -705,7 +703,7 @@ def test_fail_task_wrong_state_returns_400(
         patch("app.services.task_lifecycle.task_queries.get_task_by_id", return_value=mock_task),
         patch("app.services.task_lifecycle.task_queries.get_active_assignment_for_provider_task", return_value=mock_assignment),
     ):
-        response = client.post(f"/tasks/{TASK_ID}/fail")
+        response = client.post(f"/tasks/{mock_task['id']}/fail")
 
     assert response.status_code == 400
     assert "procesamiento" in response.json()["detail"]
@@ -715,5 +713,5 @@ def test_fail_task_requires_authentication(unauthenticated_client: TestClient) -
     """
     POST /tasks/{id}/fail sin token devuelve 401.
     """
-    response = unauthenticated_client.post(f"/tasks/{TASK_ID}/fail")
+    response = unauthenticated_client.post(f"/tasks/{uuid.uuid4()}/fail")
     assert response.status_code == 401
