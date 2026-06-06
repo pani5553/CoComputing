@@ -1,0 +1,49 @@
+services:
+
+  # ── Backend FastAPI ──────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: deploy/backend.Dockerfile
+    container_name: cocomputing-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - backend/.env
+    environment:
+      # Sobrescribe FRONTEND_URL para apuntar al frontend dentro de docker
+      FRONTEND_URL: "http://localhost:3000"
+      # En producción cambia a 'production' para deshabilitar /docs y /redoc
+      ENVIRONMENT: "${ENVIRONMENT:-development}"
+    networks:
+      - cocomputing-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ── Frontend React/nginx ─────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: .
+      dockerfile: deploy/frontend.Dockerfile
+      args:
+        # En dev el frontend llama al backend directamente por el puerto expuesto.
+        # En producción detrás de un reverse proxy, cambiar a la URL pública.
+        VITE_API_URL: "${VITE_API_URL:-http://localhost:8000}"
+    container_name: cocomputing-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    networks:
+      - cocomputing-net
+    depends_on:
+      backend:
+        condition: service_healthy
+
+networks:
+  cocomputing-net:
+    driver: bridge
