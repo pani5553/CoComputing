@@ -3,6 +3,10 @@ Database queries for wallets and transactions.
 """
 from typing import Any
 
+import psycopg2
+import psycopg2.extras
+
+from app.core.config import settings
 from app.db.client import get_supabase
 
 
@@ -86,28 +90,28 @@ def update_wallet_on_task_complete(
     reward: float,
 ) -> dict[str, Any]:
     """
-    Increment available_balance and total_earned by reward.
+    Atomically increment available_balance and total_earned by reward using psycopg2.
+    Avoids the read-modify-write race condition present in the SDK-based approach.
     Returns the updated wallet row.
     """
-    wallet = get_wallet_by_provider_id(provider_id)
-    if wallet is None:
+    sql = """
+        UPDATE wallets
+        SET available_balance = available_balance + %s,
+            total_earned      = total_earned      + %s
+        WHERE provider_id = %s
+        RETURNING *
+    """
+    with psycopg2.connect(
+        settings.supabase_db_url,
+        cursor_factory=psycopg2.extras.RealDictCursor,
+    ) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (round(reward, 2), round(reward, 2), provider_id))
+            row = cur.fetchone()
+            conn.commit()
+    if row is None:
         raise ValueError(f"No wallet found for provider {provider_id}")
-
-    new_available = float(wallet["available_balance"]) + reward
-    new_total_earned = float(wallet["total_earned"]) + reward
-
-    response = (
-        get_supabase().table("wallets")
-        .update(
-            {
-                "available_balance": round(new_available, 2),
-                "total_earned": round(new_total_earned, 2),
-            }
-        )
-        .eq("provider_id", provider_id)
-        .execute()
-    )
-    return response.data[0]
+    return dict(row)
 
 
 def update_wallet_on_withdraw(

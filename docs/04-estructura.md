@@ -323,3 +323,147 @@ app.include_router(profile_router, prefix="/profile", tags=["profile"])
 ```
 
 El middleware de seguridad añade `X-Content-Type-Options: nosniff` y `X-Frame-Options: DENY` a todas las respuestas.
+
+---
+
+## Estructura adicional — Feature "Cómputo Real Distribuido"
+
+Los siguientes ficheros y directorios se añaden al árbol existente. No se modifica ni elimina ningún fichero de la estructura anterior.
+
+### Nuevos módulos en `backend/`
+
+```
+backend/
+│
+├── app/
+│   │
+│   ├── routers/
+│   │   ├── compute.py          # Router de /jobs (lado cliente)
+│   │   │                       #   POST /jobs
+│   │   │                       #   GET  /jobs
+│   │   │                       #   GET  /jobs/{job_id}
+│   │   │                       #   GET  /jobs/{job_id}/result
+│   │   └── work.py             # Router de /work (lado worker)
+│   │                           #   POST /work/claim
+│   │                           #   POST /work/{chunk_id}/submit
+│   │
+│   ├── models/
+│   │   └── compute.py          # Pydantic models: JobCreateRequest, JobPublic,
+│   │                           #   JobListResponse, ChunkWithPayload, ClaimRequest,
+│   │                           #   ClaimResponse, SubmitRequest, SubmitResponse
+│   │
+│   ├── services/
+│   │   ├── compute_service.py  # create_job(), list_jobs(), get_job(), get_job_result(),
+│   │   │                       #   finalize_job(), split_csv()
+│   │   └── consensus_service.py  # evaluate_chunk(): lógica de consenso, pago y trust
+│   │
+│   ├── db/
+│   │   └── queries/
+│   │       └── compute_queries.py  # Todas las queries para jobs, chunks, chunk_results.
+│   │                               # claim_chunks_atomic() usa psycopg2 con
+│   │                               # FOR UPDATE SKIP LOCKED (no SDK Supabase).
+│   │
+│   └── worker/
+│       ├── __init__.py
+│       ├── main.py             # Entry point: python -m app.worker
+│       │                       #   --api  URL de la API (default: http://localhost:8000)
+│       │                       #   --email  Email del proveedor/worker
+│       │                       #   --password  Password del proveedor/worker
+│       │                       #   --poll-interval  Segundos entre polls (default: 5)
+│       │                       #   --max-chunks  Chunks por claim (default: 3)
+│       └── plugins/
+│           ├── __init__.py     # PLUGINS dict: {"data-processing": DataProcessingPlugin}
+│           │                   # Función get_plugin(job_type) -> WorkerPlugin
+│           ├── base.py         # Clase abstracta WorkerPlugin con método process(payload)
+│           └── data_processing.py  # DataProcessingPlugin: usa polars para mean/sum/min/max/count
+│
+├── tests/
+│   ├── test_compute.py         # Tests del router /jobs (casos C-01 a C-05)
+│   └── test_consensus.py       # Tests del servicio de consenso (casos K-01 a K-07)
+│
+└── scripts/
+    └── run_workers.sh          # Lanza 3 instancias del worker en paralelo para demo
+                                # Requiere WORKER_EMAIL y WORKER_PASSWORD como env vars
+```
+
+### Nuevos ficheros en `frontend/`
+
+```
+frontend/src/
+│
+├── api/
+│   └── compute.ts              # createJob(formData), listJobs(status?), getJob(id),
+│                               #   getJobResult(id)
+│
+├── types/
+│   └── compute.ts              # Interfaces TypeScript: Job, JobStatus, ChunkStatus,
+│                               #   ClaimResponse, ChunkWithPayload, SubmitRequest,
+│                               #   SubmitResponse, JobCreateRequest, JobListResponse
+│
+├── store/
+│   └── jobStore.ts             # Zustand: { jobs, currentJob }
+│                               #   actions: setJobs(), setCurrentJob(), updateJobProgress()
+│                               #   middleware: NO persiste (datos volátiles)
+│
+├── pages/
+│   ├── JobsPage.tsx            # Ruta: /trabajos (protegida)
+│   │                           #   Lista de jobs del cliente con estado y progreso real
+│   │                           #   Botón "Nuevo trabajo" → abre modal o navega a /trabajos/nuevo
+│   └── NewJobPage.tsx          # Ruta: /trabajos/nuevo (protegida)
+│                               #   Formulario: subir CSV + elegir operación + columnas
+│                               #   Reusa Button, Card, Spinner, Alert existentes
+│
+├── components/
+│   └── jobs/
+│       ├── JobCard.tsx         # Tarjeta de job: tipo, estado (badge), progreso (ProgressBar)
+│       │                       #   Props: job: Job
+│       ├── JobStatusBadge.tsx  # Badge con color semántico por JobStatus
+│       │                       #   pending/splitting → gris, processing → azul,
+│       │                       #   validating → amarillo, completed → verde, failed → rojo
+│       ├── JobResultView.tsx   # Visualización del resultado consolidado (tabla/JSON)
+│       │                       #   Props: result: Record<string, unknown>
+│       └── CsvUploadForm.tsx   # Formulario de subida: input[type=file] + select operación
+│                               #   + multiselect columnas (lectura previa de cabeceras CSV)
+│                               #   Reusa Button, Spinner, Alert existentes
+│
+└── hooks/
+    └── useJobProgress.ts       # setInterval 5000ms → GET /jobs/{id}
+                                #   Gestiona cleanup en unmount
+                                #   Para cuando status = 'completed' | 'failed'
+```
+
+### Actualización de `app/main.py` (dos líneas a añadir al bloque de imports y registration)
+
+```python
+# Añadir al bloque de imports en app/main.py
+from app.routers import compute, work   # junto a los imports existentes: auth, profile, tasks, wallet
+
+# Añadir al bloque de router registration
+app.include_router(compute.router, prefix="/jobs",  tags=["compute"])
+app.include_router(work.router,    prefix="/work",  tags=["work"])
+```
+
+### Actualización del orden de creación
+
+El orden de trabajo para la nueva feature es:
+
+1. Database Engineer verifica que `migrations/004_compute.sql` está ejecutado en Supabase.
+2. Backend Dev implementa en este orden:
+   a. `app/models/compute.py` (Pydantic models)
+   b. `app/db/queries/compute_queries.py` (queries, incluyendo `claim_chunks_atomic` con psycopg2)
+   c. `app/services/compute_service.py` (split + create_job + finalize_job)
+   d. `app/services/consensus_service.py` (evaluate_chunk)
+   e. `wallet_service.credit_reward()` — función nueva a añadir en el servicio existente
+   f. `app/routers/compute.py` y `app/routers/work.py`
+   g. Registro en `app/main.py`
+   h. `app/worker/` completo
+3. Frontend Dev implementa en paralelo desde los contratos de `docs/04-api-contracts.md §6`.
+4. Ambos ejecutan sus suites de tests antes de integrar.
+
+### Dependencia nueva en `requirements.txt`
+
+```
+polars>=0.20.0
+```
+
+La dependencia `polars` solo es necesaria en el proceso worker. Para el backend FastAPI no se importa en el path de inicialización; el import ocurre únicamente dentro de `DataProcessingPlugin.process()`. Esto evita que un error de instalación de polars rompa el arranque de la API.

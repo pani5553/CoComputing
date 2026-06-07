@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.core.config import settings
-from app.routers import auth, profile, tasks, wallet
+from app.routers import auth, compute, profile, tasks, wallet, work
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -87,6 +87,8 @@ app.include_router(auth.router, prefix="/auth", tags=["auth"])
 app.include_router(tasks.router, prefix="/tasks", tags=["tasks"])
 app.include_router(wallet.router, prefix="/wallet", tags=["wallet"])
 app.include_router(profile.router, prefix="/profile", tags=["profile"])
+app.include_router(compute.router, prefix="/jobs", tags=["compute"])
+app.include_router(work.router, prefix="/work", tags=["work"])
 
 
 # ──────────────────────────────────────────────────────────────────────────────

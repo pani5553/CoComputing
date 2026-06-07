@@ -1166,3 +1166,691 @@ Donde `total_finalized = tasks_completed + tasks_failed`. Si `total_finalized = 
 | 500 | Error no controlado del servidor | "Error interno del servidor" |
 
 Los mensajes 401, 403 y 500 son genéricos y no exponen detalles internos.
+
+---
+
+## 6. Compute API — Cómputo Real Distribuido
+
+Esta sección documenta el pipeline de cómputo distribuido añadido en la feature "Cómputo Real". Todos los endpoints son adicionales; ningún contrato de las secciones anteriores se modifica.
+
+---
+
+### 6.1 Modelo de Datos — Tablas nuevas
+
+#### Tabla `jobs`
+
+| Campo | Tipo PostgreSQL | Nulo | Defecto | Descripción |
+|-------|----------------|------|---------|-------------|
+| `id` | `uuid` | NO | `gen_random_uuid()` | PK |
+| `client_id` | `uuid` | NO | — | FK → `providers.id`. El proveedor que actúa como cliente del job. |
+| `job_type` | `text` | NO | — | `data-processing`. Extensible con futuros tipos. |
+| `status` | `text` | NO | `'pending'` | `pending` \| `splitting` \| `processing` \| `validating` \| `completed` \| `failed` |
+| `params` | `jsonb` | NO | `{}` | Para `data-processing`: `{"operation":"mean","columns":["col1"]}` |
+| `total_chunks` | `integer` | NO | `0` | Total de chunks en que se dividió el job. Fijado durante `splitting`. |
+| `completed_chunks` | `integer` | NO | `0` | Chunks ya validados. Incrementado atómicamente al validar cada chunk. |
+| `reward_total` | `numeric(10,2)` | NO | `0.00` | Recompensa total del job en CC. Distribuida entre proveedores con resultados válidos. |
+| `result` | `jsonb` | SÍ | `null` | Resultado consolidado. NULL hasta que el job alcance `completed`. |
+| `created_at` | `timestamptz` | NO | `now()` | |
+| `completed_at` | `timestamptz` | SÍ | `null` | Timestamp al alcanzar `completed` o `failed`. |
+
+**Restricciones:**
+- `CHECK (job_type IN ('data-processing'))`
+- `CHECK (status IN ('pending', 'splitting', 'processing', 'validating', 'completed', 'failed'))`
+- `CHECK (total_chunks >= 0)`
+- `CHECK (completed_chunks >= 0)`
+- `CHECK (completed_chunks <= total_chunks)`
+- `CHECK (reward_total >= 0.00)`
+
+**Índices:**
+- `idx_jobs_client_id` en `(client_id)`
+- `idx_jobs_status` en `(status)`
+- `idx_jobs_client_status` en `(client_id, status)`
+
+---
+
+#### Tabla `chunks`
+
+| Campo | Tipo PostgreSQL | Nulo | Defecto | Descripción |
+|-------|----------------|------|---------|-------------|
+| `id` | `uuid` | NO | `gen_random_uuid()` | PK |
+| `job_id` | `uuid` | NO | — | FK → `jobs.id` ON DELETE CASCADE |
+| `chunk_index` | `integer` | NO | — | Posición ordinal dentro del job. Empieza en 0. |
+| `payload` | `jsonb` | NO | — | Para `data-processing`: `{"rows":[[...]],"columns":["col1"]}` |
+| `status` | `text` | NO | `'pending'` | `pending` \| `assigned` \| `done` \| `rejected` |
+| `assigned_to` | `uuid` | SÍ | `null` | FK → `providers.id`. NULL cuando está `pending` o `rejected`. |
+| `attempts` | `integer` | NO | `0` | Veces que el scheduler ha intentado asignar este chunk. |
+| `replicas_needed` | `integer` | NO | `2` | Número de proveedores distintos que deben procesar el chunk para consenso. |
+| `created_at` | `timestamptz` | NO | `now()` | |
+
+**Restricciones:**
+- `UNIQUE (job_id, chunk_index)`
+- `CHECK (status IN ('pending', 'assigned', 'done', 'rejected'))`
+- `CHECK (chunk_index >= 0)`
+- `CHECK (attempts >= 0)`
+- `CHECK (replicas_needed >= 1)`
+
+**Índices:**
+- `idx_chunks_job_id` en `(job_id)`
+- `idx_chunks_status` en `(status)`
+- `idx_chunks_job_status` en `(job_id, status)`
+- `idx_chunks_assigned_to` parcial en `(assigned_to) WHERE assigned_to IS NOT NULL`
+
+**Nota sobre `replicas_needed` vs `assigned_to`:** La columna `assigned_to` registra solo al proveedor con asignación activa más reciente (para reintento). El conteo real de resultados entregados se obtiene de `chunk_results`. El claim atómico lee `chunk_results` para determinar cuántas réplicas faltan antes de marcar el chunk como `done`.
+
+---
+
+#### Tabla `chunk_results`
+
+| Campo | Tipo PostgreSQL | Nulo | Defecto | Descripción |
+|-------|----------------|------|---------|-------------|
+| `id` | `uuid` | NO | `gen_random_uuid()` | PK |
+| `chunk_id` | `uuid` | NO | — | FK → `chunks.id` ON DELETE CASCADE |
+| `provider_id` | `uuid` | NO | — | FK → `providers.id` ON DELETE RESTRICT |
+| `result` | `jsonb` | NO | — | Resultado del cómputo del chunk por este proveedor. |
+| `duration_ms` | `integer` | NO | — | Tiempo de procesamiento en ms reportado por el worker. > 0. |
+| `is_valid` | `boolean` | SÍ | `null` | `null`=pendiente, `true`=válido por consenso, `false`=rechazado. |
+| `created_at` | `timestamptz` | NO | `now()` | |
+
+**Restricciones:**
+- `UNIQUE (chunk_id, provider_id)` — un proveedor solo puede entregar un resultado por chunk
+- `CHECK (duration_ms > 0)`
+
+**Índices:**
+- `idx_chunk_results_chunk_id` en `(chunk_id)`
+- `idx_chunk_results_provider_id` en `(provider_id)`
+- `idx_chunk_results_is_valid` en `(chunk_id, is_valid)`
+
+---
+
+#### 6.1.1 Relaciones entre tablas nuevas y existentes
+
+```
+providers (1) ──── (N) jobs          [client_id → providers.id]
+providers (1) ──── (N) chunks        [assigned_to → providers.id, nullable]
+providers (1) ──── (N) chunk_results [provider_id → providers.id]
+
+jobs (1) ──── (N) chunks             [job_id → jobs.id, CASCADE DELETE]
+chunks (1) ──── (N) chunk_results    [chunk_id → chunks.id, CASCADE DELETE]
+```
+
+---
+
+### 6.2 Tipos Pydantic (backend) y TypeScript (frontend)
+
+#### Pydantic — `app/models/compute.py`
+
+```python
+from uuid import UUID
+from datetime import datetime
+from typing import Any
+from pydantic import BaseModel, Field
+
+# ── Jobs ──────────────────────────────────────────────────────────────────────
+
+class JobCreateRequest(BaseModel):
+    job_type: str = Field(..., pattern="^data-processing$")
+    params: dict[str, Any]
+    # El CSV se sube como multipart/form-data; este modelo cubre el body JSON puro.
+    # Para CSV: endpoint acepta UploadFile + params como Form field (JSON string).
+
+class JobPublic(BaseModel):
+    id: UUID
+    client_id: UUID
+    job_type: str
+    status: str
+    params: dict[str, Any]
+    total_chunks: int
+    completed_chunks: int
+    reward_total: float
+    result: dict[str, Any] | None
+    created_at: datetime
+    completed_at: datetime | None
+    progress: float   # campo calculado: completed_chunks / total_chunks * 100
+
+class JobListResponse(BaseModel):
+    count: int
+    jobs: list[JobPublic]
+
+# ── Chunks ────────────────────────────────────────────────────────────────────
+
+class ChunkPublic(BaseModel):
+    id: UUID
+    job_id: UUID
+    chunk_index: int
+    status: str
+    assigned_to: UUID | None
+    attempts: int
+    replicas_needed: int
+    created_at: datetime
+    # payload NO se expone al cliente (puede contener datos grandes)
+
+class ClaimResponse(BaseModel):
+    chunks: list[ChunkWithPayload]
+
+class ChunkWithPayload(BaseModel):
+    chunk_id: UUID
+    job_id: UUID
+    chunk_index: int
+    job_type: str
+    payload: dict[str, Any]   # datos reales para procesar
+
+# ── Submit ────────────────────────────────────────────────────────────────────
+
+class SubmitRequest(BaseModel):
+    result: dict[str, Any]
+    duration_ms: int = Field(..., gt=0)
+
+class SubmitResponse(BaseModel):
+    chunk_result_id: UUID
+    chunk_id: UUID
+    status: str              # estado del chunk tras submit: "assigned" | "done"
+    message: str
+```
+
+#### TypeScript — `frontend/src/types/compute.ts`
+
+```typescript
+export type JobStatus =
+  | 'pending'
+  | 'splitting'
+  | 'processing'
+  | 'validating'
+  | 'completed'
+  | 'failed';
+
+export type ChunkStatus = 'pending' | 'assigned' | 'done' | 'rejected';
+
+export interface Job {
+  id: string;
+  client_id: string;
+  job_type: string;
+  status: JobStatus;
+  params: Record<string, unknown>;
+  total_chunks: number;
+  completed_chunks: number;
+  reward_total: number;
+  result: Record<string, unknown> | null;
+  created_at: string;       // ISO 8601 UTC
+  completed_at: string | null;
+  progress: number;         // 0–100, calculado por el backend
+}
+
+export interface JobListResponse {
+  count: number;
+  jobs: Job[];
+}
+
+export interface ChunkWithPayload {
+  chunk_id: string;
+  job_id: string;
+  chunk_index: number;
+  job_type: string;
+  payload: Record<string, unknown>;
+}
+
+export interface ClaimResponse {
+  chunks: ChunkWithPayload[];
+}
+
+export interface SubmitRequest {
+  result: Record<string, unknown>;
+  duration_ms: number;
+}
+
+export interface SubmitResponse {
+  chunk_result_id: string;
+  chunk_id: string;
+  status: ChunkStatus;
+  message: string;
+}
+
+export interface JobCreateRequest {
+  job_type: 'data-processing';
+  params: {
+    operation: 'mean' | 'sum' | 'min' | 'max' | 'count';
+    columns?: string[];
+  };
+}
+```
+
+---
+
+### 6.3 Endpoints del Router `/jobs` (lado cliente)
+
+**Prefijo registrado en `app/main.py`:** `/jobs`
+**Módulo:** `app/routers/compute.py`
+**Auth:** Todos los endpoints requieren `[AUTH]` (Bearer JWT).
+
+---
+
+#### `POST /jobs` [AUTH]
+
+Crea un nuevo job de cómputo. Admite dos variantes de body:
+
+**Variante A — JSON puro (datos embebidos en `params`):**
+
+```
+Content-Type: application/json
+```
+
+```json
+{
+  "job_type": "data-processing",
+  "params": {
+    "operation": "mean",
+    "columns": ["precio", "cantidad"],
+    "data": [[1, 2], [3, 4], [5, 6]]
+  }
+}
+```
+
+**Variante B — Multipart form (CSV adjunto):**
+
+```
+Content-Type: multipart/form-data
+```
+
+| Campo | Tipo | Requerido | Descripción |
+|-------|------|-----------|-------------|
+| `job_type` | string (form field) | Sí | `"data-processing"` |
+| `params` | string JSON (form field) | Sí | `{"operation":"mean","columns":["precio"]}` |
+| `file` | UploadFile | Sí | Archivo CSV. Max 10 MB. |
+
+**Lógica de splitting:** El servicio lee el CSV, lo divide en chunks de ~500 filas cada uno. Para N filas totales, se crean `ceil(N / 500)` chunks. El reward total del job se fija en `0.10 CC × total_chunks`.
+
+**Response 201 — Job creado:**
+
+```json
+{
+  "id": "job-uuid-1",
+  "client_id": "550e8400-...",
+  "job_type": "data-processing",
+  "status": "processing",
+  "params": {
+    "operation": "mean",
+    "columns": ["precio", "cantidad"]
+  },
+  "total_chunks": 4,
+  "completed_chunks": 0,
+  "reward_total": 0.40,
+  "result": null,
+  "created_at": "2026-06-07T10:00:00Z",
+  "completed_at": null,
+  "progress": 0.0
+}
+```
+
+El status del job pasa por `pending` → `splitting` → `processing` antes de devolver la respuesta. El cliente recibe el job ya en `processing` con sus chunks creados.
+
+**Response 400 — Tipo de job no soportado:**
+
+```json
+{ "detail": "Tipo de job no soportado: transcription" }
+```
+
+**Response 400 — CSV vacío o sin columnas válidas:**
+
+```json
+{ "detail": "El archivo CSV no contiene datos válidos" }
+```
+
+**Response 413 — Archivo demasiado grande:**
+
+```json
+{ "detail": "El archivo CSV no puede superar 10 MB" }
+```
+
+**Response 422 — Validación de campos fallida.**
+
+---
+
+#### `GET /jobs` [AUTH]
+
+Lista todos los jobs del proveedor autenticado (como cliente), ordenados por `created_at DESC`.
+
+**Query parameters:**
+
+| Parámetro | Tipo | Requerido | Descripción |
+|-----------|------|-----------|-------------|
+| `status` | string | No | Filtra por estado. Ej: `processing`, `completed`. |
+
+**Response 200:**
+
+```json
+{
+  "count": 2,
+  "jobs": [
+    {
+      "id": "job-uuid-1",
+      "client_id": "550e8400-...",
+      "job_type": "data-processing",
+      "status": "processing",
+      "params": {"operation": "mean", "columns": ["precio"]},
+      "total_chunks": 4,
+      "completed_chunks": 2,
+      "reward_total": 0.40,
+      "result": null,
+      "created_at": "2026-06-07T10:00:00Z",
+      "completed_at": null,
+      "progress": 50.0
+    }
+  ]
+}
+```
+
+**Response 200 — Sin jobs:**
+
+```json
+{ "count": 0, "jobs": [] }
+```
+
+---
+
+#### `GET /jobs/{job_id}` [AUTH]
+
+Detalle de un job con progreso real en tiempo de consulta.
+
+**Path parameter:** `job_id` (UUID)
+
+**Response 200:**
+
+```json
+{
+  "id": "job-uuid-1",
+  "client_id": "550e8400-...",
+  "job_type": "data-processing",
+  "status": "processing",
+  "params": {"operation": "mean", "columns": ["precio", "cantidad"]},
+  "total_chunks": 4,
+  "completed_chunks": 2,
+  "reward_total": 0.40,
+  "result": null,
+  "created_at": "2026-06-07T10:00:00Z",
+  "completed_at": null,
+  "progress": 50.0
+}
+```
+
+El campo `progress` = `completed_chunks / total_chunks × 100` (redondeado a 1 decimal). Si `total_chunks = 0`, `progress = 0.0`.
+
+**Response 403 — El job no pertenece al proveedor autenticado:**
+
+```json
+{ "detail": "No tienes permiso para realizar esta acción" }
+```
+
+**Response 404 — Job no encontrado:**
+
+```json
+{ "detail": "Job no encontrado" }
+```
+
+---
+
+#### `GET /jobs/{job_id}/result` [AUTH]
+
+Devuelve el resultado consolidado del job. Solo disponible cuando `status = 'completed'`.
+
+**Path parameter:** `job_id` (UUID)
+
+**Response 200 — Job completado:**
+
+```json
+{
+  "id": "job-uuid-1",
+  "status": "completed",
+  "result": {
+    "operation": "mean",
+    "columns": {
+      "precio": 3.0,
+      "cantidad": 4.0
+    }
+  },
+  "total_chunks": 4,
+  "completed_chunks": 4,
+  "completed_at": "2026-06-07T10:05:00Z"
+}
+```
+
+**Response 400 — Job aún no completado:**
+
+```json
+{ "detail": "El job aún no ha sido completado (estado actual: processing)" }
+```
+
+**Response 403 — El job no pertenece al proveedor autenticado:**
+
+```json
+{ "detail": "No tienes permiso para realizar esta acción" }
+```
+
+**Response 404 — Job no encontrado:**
+
+```json
+{ "detail": "Job no encontrado" }
+```
+
+---
+
+### 6.4 Endpoints del Router `/work` (lado worker)
+
+**Prefijo registrado en `app/main.py`:** `/work`
+**Módulo:** `app/routers/work.py`
+**Auth:** Todos los endpoints requieren `[AUTH]` (Bearer JWT del proveedor/worker).
+
+---
+
+#### `POST /work/claim` [AUTH]
+
+El worker solicita hasta `max_chunks` chunks pendientes para procesar. La asignación es **atómica** (no puede haber dos workers reclamando el mismo chunk simultáneamente).
+
+**Lógica de claim atómico:** Se usa psycopg2 con una query `UPDATE ... WHERE ... RETURNING` envuelta en `BEGIN`/`COMMIT`. La condición de selección garantiza que solo se asignan chunks donde el proveedor autenticado no haya entregado resultado aún:
+
+```sql
+-- Ejecutado via psycopg2 con BEGIN explícito:
+WITH candidates AS (
+    SELECT c.id
+    FROM chunks c
+    WHERE c.status = 'pending'
+      AND NOT EXISTS (
+          SELECT 1 FROM chunk_results cr
+          WHERE cr.chunk_id = c.id
+            AND cr.provider_id = %(provider_id)s
+      )
+    ORDER BY c.created_at ASC
+    LIMIT %(max_chunks)s
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE chunks
+SET status = 'assigned',
+    assigned_to = %(provider_id)s,
+    attempts = attempts + 1
+FROM candidates
+WHERE chunks.id = candidates.id
+RETURNING chunks.id, chunks.job_id, chunks.chunk_index,
+          chunks.payload, chunks.replicas_needed;
+```
+
+`FOR UPDATE SKIP LOCKED` garantiza que dos workers concurrentes no reclamen el mismo chunk. No bloquea; el segundo worker simplemente recibe el siguiente chunk disponible.
+
+**Request body:**
+
+```json
+{
+  "max_chunks": 3
+}
+```
+
+| Campo | Tipo | Requerido | Validación |
+|-------|------|-----------|------------|
+| `max_chunks` | integer | Sí | ge=1, le=10. Cuántos chunks reclamar en este ciclo. |
+
+**Response 200 — Chunks reclamados:**
+
+```json
+{
+  "chunks": [
+    {
+      "chunk_id": "chunk-uuid-1",
+      "job_id": "job-uuid-1",
+      "chunk_index": 0,
+      "job_type": "data-processing",
+      "payload": {
+        "rows": [[1, "A"], [2, "B"]],
+        "columns": ["precio", "categoria"]
+      }
+    },
+    {
+      "chunk_id": "chunk-uuid-2",
+      "job_id": "job-uuid-1",
+      "chunk_index": 1,
+      "job_type": "data-processing",
+      "payload": {
+        "rows": [[3, "C"], [4, "D"]],
+        "columns": ["precio", "categoria"]
+      }
+    }
+  ]
+}
+```
+
+**Response 200 — No hay chunks disponibles:**
+
+```json
+{ "chunks": [] }
+```
+
+El worker interpreta una lista vacía como "nada que procesar ahora" y espera antes del próximo polling.
+
+**Response 422 — Validación de body fallida (ej. max_chunks = 0).**
+
+---
+
+#### `POST /work/{chunk_id}/submit` [AUTH]
+
+El worker entrega el resultado de un chunk procesado. El servicio ejecuta la validación por consenso y, si el chunk se valida, actualiza el job y lanza el pago.
+
+**Path parameter:** `chunk_id` (UUID)
+
+**Request body:**
+
+```json
+{
+  "result": {
+    "precio_mean": 3.14,
+    "cantidad_mean": 42.0
+  },
+  "duration_ms": 1250
+}
+```
+
+| Campo | Tipo | Requerido | Validación |
+|-------|------|-----------|------------|
+| `result` | object | Sí | Cualquier objeto JSON no nulo. |
+| `duration_ms` | integer | Sí | gt=0. Tiempo real de cómputo en ms. |
+
+**Response 200 — Resultado aceptado, consenso pendiente (solo 1 réplica entregada de 2 necesarias):**
+
+```json
+{
+  "chunk_result_id": "cr-uuid-1",
+  "chunk_id": "chunk-uuid-1",
+  "status": "assigned",
+  "message": "Resultado recibido. Esperando segunda réplica para validar."
+}
+```
+
+**Response 200 — Resultado aceptado, chunk validado por consenso (2 réplicas coinciden):**
+
+```json
+{
+  "chunk_result_id": "cr-uuid-2",
+  "chunk_id": "chunk-uuid-1",
+  "status": "done",
+  "message": "Chunk validado. Recompensa acreditada."
+}
+```
+
+**Response 200 — Resultado aceptado, desacuerdo entre réplicas (necesita 3.er desempate):**
+
+```json
+{
+  "chunk_result_id": "cr-uuid-2",
+  "chunk_id": "chunk-uuid-1",
+  "status": "assigned",
+  "message": "Desacuerdo entre réplicas. Se asignará un tercer proveedor para desempate."
+}
+```
+
+En este caso el servicio cambia el chunk de vuelta a `pending` para que otro worker lo reclame.
+
+**Response 400 — El proveedor no tiene este chunk asignado:**
+
+```json
+{ "detail": "No tienes este chunk asignado" }
+```
+
+**Response 400 — Ya entregaste un resultado para este chunk:**
+
+```json
+{ "detail": "Ya has entregado un resultado para este chunk" }
+```
+
+**Response 404 — Chunk no encontrado:**
+
+```json
+{ "detail": "Chunk no encontrado" }
+```
+
+---
+
+### 6.5 Resumen de Endpoints Compute
+
+| Método | Ruta | Auth | Descripción |
+|--------|------|------|-------------|
+| `POST` | `/jobs` | Sí | Crear job (cliente) |
+| `GET` | `/jobs` | Sí | Listar mis jobs (cliente) |
+| `GET` | `/jobs/{job_id}` | Sí | Detalle con progreso real (cliente) |
+| `GET` | `/jobs/{job_id}/result` | Sí | Resultado consolidado (cliente) |
+| `POST` | `/work/claim` | Sí | Reclamar chunks (worker) |
+| `POST` | `/work/{chunk_id}/submit` | Sí | Entregar resultado (worker) |
+
+---
+
+### 6.6 Fórmulas de Negocio — Compute
+
+#### Reward por chunk
+
+```
+reward_per_chunk = job.reward_total / job.total_chunks
+```
+
+Solo se paga por resultados con `is_valid = true`. Un resultado marcado `is_valid = false` no genera pago y aplica penalización de Trust Score (`accuracy -= 5`, usando `trust_score.update_accuracy_on_fail`).
+
+#### Progreso del job
+
+```
+progress = (completed_chunks / total_chunks) × 100
+```
+
+Si `total_chunks = 0`, `progress = 0.0`. Se redondea a 1 decimal.
+
+#### Chunk splitting para CSV
+
+```
+chunk_size = 500 filas
+total_chunks = ceil(total_rows / chunk_size)
+chunk[i].payload = {
+  "rows": rows[i*500 : (i+1)*500],
+  "columns": csv_headers
+}
+```
+
+#### Actualización de Trust Score por resultado de chunk
+
+| Evento | `accuracy` | `response_time_score` |
+|--------|------------|----------------------|
+| Resultado válido (`is_valid=true`) | `min(accuracy + 2, 100)` | sin cambio |
+| Resultado inválido (`is_valid=false`) | `max(accuracy - 5, 0)` | sin cambio |
+
+Usa directamente las funciones `update_accuracy_on_complete` y `update_accuracy_on_fail` de `app/services/trust_score.py`.

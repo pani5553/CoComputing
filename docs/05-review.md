@@ -534,3 +534,545 @@ El Security Auditor debe priorizar los siguientes puntos que tienen impacto dire
 6. **Seed en producción:** El archivo `migrations/003_seed.sql` inserta un proveedor demo con credenciales conocidas (`demo@co-computing.io` / `demo1234`). Verificar que este seed no se ejecuta en entornos de producción o que la cuenta demo se deshabilita/elimina antes del go-live.
 
 7. **`supabase_service_role_key` en config:** Esta clave bypasea todo RLS. Verificar que el `.env` nunca se sube al repositorio (hay `.gitignore` y `.env.example`, confirmado), y que en el entorno de despliegue se gestiona como secret (no como variable de entorno plana en CI logs).
+
+---
+
+## Revisión Feature Cómputo Real — 2026-06-07
+
+**Revisor:** Code Reviewer Senior
+**Scope:** feature/computo-real — archivos nuevos y modificados listados en el encargo
+**Referencia:** `briefs/02-computo-real.md`
+
+---
+
+### Índice de hallazgos
+
+| ID | Severidad | Resumen |
+|----|-----------|---------|
+| R2-C-01 | CRÍTICO | `JobListPage.tsx` no compila: `Link` y `Button` usados sin importar |
+| R2-C-02 | CRÍTICO | Race condition en `update_wallet_on_task_complete` — mismo patrón no-atómico ya marcado como C-03 en revisión anterior, ahora usado por `credit_reward` |
+| R2-C-03 | CRÍTICO | `consensus_service.py`: el bloque de pay+trust no es transaccional — si `credit_reward` tiene éxito pero `update_provider` falla, el pago queda acreditado y el trust sin actualizar |
+| R2-A-01 | ALTO | `HTTP_413_REQUEST_ENTITY_TOO_LARGE` deprecado (QA bug #1 — NO corregido) |
+| R2-A-02 | ALTO | `class Config` en `JobPublic` (QA bug #2 — NO corregido) |
+| R2-A-03 | ALTO | Submit duplicado devuelve 400 en vez de 409 (QA bug #3 — NO corregido) |
+| R2-A-04 | ALTO | US-38 CA-8: chunk con >5 intentos no se marca como `rejected` (QA bug #4 — NO implementado) |
+| R2-A-05 | ALTO | `create_job_with_chunks` no es atómica: job se crea aunque falle la inserción de chunks |
+| R2-A-06 | ALTO | `claim_chunks_atomic` sobrescribe `assigned_to` con el último reclamante pero el campo sólo admite un proveedor — el segundo reclamante de un chunk con `replicas_needed=2` pierde su assignment |
+| R2-M-01 | MEDIO | `REWARD_PER_CHUNK` definido en tres módulos distintos |
+| R2-M-02 | MEDIO | `test_compute_endpoints.py` y `test_compute_service.py` referenciados en el encargo no existen — existen como `test_compute.py` y los de consenso en `test_consensus.py` |
+| R2-M-03 | MEDIO | `finalize_job` no marca el job como `validating` durante la reducción |
+| R2-M-04 | MEDIO | `get_job_result` devuelve 400 cuando el job no está `completed` — semánticamente debería ser 409 o 202 |
+| R2-M-05 | MEDIO | `JobResultPage.tsx`: extracción del resultado asume estructura `{operation, columns:{...}}` que no coincide con el formato real de `finalize_job` |
+| R2-M-06 | MEDIO | `split_csv` vulnerable a CSV con muchas columnas vacías (ReDoS no aplica, pero sí DoS por memoria) |
+| R2-B-01 | BAJO | `parseCsvText` en `NewJobPage.tsx` no maneja campos CSV con comas internas ni comillas dobles correctamente |
+| R2-B-02 | BAJO | El worker cierra sesión (`sys.exit`) en caso de fallo de login, sin posibilidad de recuperación |
+| R2-B-03 | BAJO | `JobDetailPage` y `JobListPage` duplican la definición de `jobStatusConfig`/`statusConfig` y `isInFlight` |
+| R2-B-04 | BAJO | `JobResultPage.tsx` calcula `rewardTotal` como `total_chunks * 0.1` hardcodeado, ignorando el `reward_total` que ya viene del backend |
+| R2-B-05 | BAJO | Acento tipográfico faltante en banner de `JobDetailPage.tsx` ("exito" → "éxito") |
+| R2-INFO-01 | INFO | `get_valid_results_for_job` y `count_done_and_rejected_chunks` abren conexiones psycopg2 sin pool — mismo patrón señalado en A-06 de la revisión anterior |
+| R2-INFO-02 | INFO | La migración `004_compute.sql` es idempotente y bien documentada |
+| R2-INFO-03 | INFO | El sistema de plugins (`WorkerPlugin` + `get_plugin`) está correctamente diseñado para extensibilidad futura |
+
+---
+
+### CRÍTICOS
+
+#### R2-C-01 — `JobListPage.tsx` no compila: `Link` y `Button` usados sin importar
+
+**Archivo:** `frontend/src/pages/JobListPage.tsx`, líneas 87, 124, 185, 192
+
+**Descripción:**
+El componente `JobCard` usa `<Link to={...}>` (react-router-dom) en las líneas 87 y 124, y el componente `JobListPage` usa `<Button>` en las líneas 185 y 192. Ninguno de los dos está en los imports del fichero. Los imports presentes son:
+
+```
+import { useNavigate, useLocation } from 'react-router-dom'  // solo navigate y location, no Link
+// No hay import de Button
+```
+
+TypeScript/`tsc` rechazará este fichero con error `Cannot find name 'Link'` y `Cannot find name 'Button'`, haciendo que el build del frontend falle completamente. La página `JobListPage` queda inaccesible en producción.
+
+**Impacto:** Build del frontend roto. La ruta `/jobs` no puede compilarse ni renderizarse.
+
+**Corrección:**
+```typescript
+// Añadir a los imports existentes de react-router-dom:
+import { useNavigate, useLocation, Link } from 'react-router-dom'
+
+// Añadir import de Button (junto a los imports de componentes UI):
+import Button from '../components/ui/Button'
+```
+
+---
+
+#### R2-C-02 — `credit_reward` reutiliza `update_wallet_on_task_complete` no-atómico
+
+**Archivo:** `backend/app/services/wallet_service.py`, líneas 106–125
+**Archivo relacionado:** `backend/app/db/queries/wallet_queries.py`, líneas 84–110
+
+**Descripción:**
+La nueva función `credit_reward` llama a `wallet_queries.update_wallet_on_task_complete`, que ya fue marcada como CRÍTICO (C-03) en la revisión anterior por su patrón leer-modificar-escribir sin atomicidad. El nuevo código de la feature de cómputo real hereda ese bug directamente: cuando dos chunks de un mismo proveedor se validan concurrentemente, ambas llamadas a `credit_reward` pueden leer el mismo saldo base y ambas escribir sobre él, perdiendo una de las recompensas.
+
+Este riesgo es especialmente real en el contexto de esta feature: un proveedor con `replicas_needed=2` puede tener dos chunks validados casi simultáneamente (cuando dos workers entregan su segundo resultado casi al mismo tiempo). En ese escenario, ambos flujos de `process_chunk_submission` llaman a `_pay_and_update_trust`, que llama a `credit_reward`, que hace la lectura-modificación-escritura no protegida.
+
+**Impacto:** Pérdida de recompensas para los proveedores. Inconsistencia en `available_balance` y `total_earned`. El proveedor recibe menos CC de lo que le corresponde.
+
+**Corrección:** Aplicar el fix ya recomendado en C-03 de la revisión anterior. En `wallet_queries.update_wallet_on_task_complete`, reemplazar el doble round-trip por:
+```sql
+UPDATE wallets
+SET available_balance = available_balance + %s,
+    total_earned      = total_earned + %s,
+    updated_at        = now()
+WHERE provider_id = %s
+RETURNING *
+```
+Esto es atómico a nivel de motor PostgreSQL y elimina la ventana de concurrencia.
+
+---
+
+#### R2-C-03 — `_pay_and_update_trust` no es transaccional: pago y trust en pasos separados
+
+**Archivo:** `backend/app/services/consensus_service.py`, líneas 43–85
+
+**Descripción:**
+La función `_pay_and_update_trust` ejecuta en secuencia:
+1. `wallet_service.credit_reward(...)` — acredita CC al proveedor.
+2. `get_provider_by_id(...)` — lee el proveedor.
+3. Calcula nuevo `accuracy` y `trust_score`.
+4. `update_provider(...)` — actualiza accuracy, trust_score y rank.
+
+Si el paso 4 falla (error de red, timeout, error en la BD) después de que el paso 1 haya tenido éxito, el proveedor recibe el pago pero su trust score nunca se actualiza. El bloque `except` general en la línea 78 captura la excepción y solo registra un log de error (`logger.error`), sin ningún mecanismo de compensación ni reintento. El proveedor queda con saldo correcto pero trust score desactualizado.
+
+La misma inconsistencia aplica en el camino inverso: si el pago fallase pero la lectura del proveedor y el cálculo de trust ya ocurrieron, el trust se actualizaría correctamente pero el dinero no llegaría.
+
+**Impacto:** Inconsistencia entre estado financiero y estado de reputación del proveedor. Dificulta auditorías y reconciliación. No hay mecanismo de recuperación.
+
+**Corrección:** En el corto plazo, reestructurar `_pay_and_update_trust` para que no silencia el error — si el pago tuvo éxito y el trust falla, debe quedar en un log que permita reconciliación manual, y la excepción debe propagarse para que el caller (`process_chunk_submission`) pueda devolver un 500 en vez de una respuesta exitosa falsa. En el medio plazo, mover ambas operaciones a una única transacción de BD o usar un patrón outbox para garantizar exactly-once semantics.
+
+---
+
+### ALTOS
+
+#### R2-A-01 — `HTTP_413_REQUEST_ENTITY_TOO_LARGE` deprecado (QA bug #1 — NO corregido)
+
+**Archivo:** `backend/app/routers/compute.py`, línea 79
+
+**Descripción:**
+El QA identificó este problema. En Starlette/FastAPI moderno, la constante correcta es `HTTP_413_CONTENT_TOO_LARGE`. La constante `HTTP_413_REQUEST_ENTITY_TOO_LARGE` fue deprecada y puede producir un `AttributeError` en versiones futuras de Starlette.
+
+**Código actual:**
+```python
+status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+```
+
+**Corrección:**
+```python
+status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+```
+
+---
+
+#### R2-A-02 — `class Config` en `JobPublic` (QA bug #2 — NO corregido)
+
+**Archivo:** `backend/app/models/compute.py`, líneas 32–33
+
+**Descripción:**
+El QA identificó este problema. `class Config` es la sintaxis de Pydantic v1 y está deprecada en Pydantic v2. El resto del proyecto ya usa Pydantic v2 y este modelo debería ser consistente.
+
+**Código actual:**
+```python
+class Config:
+    from_attributes = True
+```
+
+**Corrección:**
+```python
+from pydantic import BaseModel, ConfigDict, Field
+...
+class JobPublic(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    ...
+```
+
+---
+
+#### R2-A-03 — Submit duplicado devuelve 400 en vez de 409 (QA bug #3 — NO corregido)
+
+**Archivo:** `backend/app/services/consensus_service.py`, líneas 156–160
+
+**Descripción:**
+El QA identificó este problema (US-36 CA-2). Cuando un proveedor intenta entregar un resultado para un chunk para el que ya ha entregado resultado, el sistema devuelve `HTTP_400_BAD_REQUEST`. El backlog pide explícitamente `409 Conflict` para este caso.
+
+**Código actual:**
+```python
+raise HTTPException(
+    status_code=status.HTTP_400_BAD_REQUEST,
+    detail="Ya has entregado un resultado para este chunk",
+)
+```
+
+**Corrección:**
+```python
+raise HTTPException(
+    status_code=status.HTTP_409_CONFLICT,
+    detail="Ya has entregado un resultado para este chunk",
+)
+```
+
+**Impacto secundario:** El test `test_k07_duplicate_submit_returns_400` (test_consensus.py línea 361) espera `status_code == 400` y necesita actualizarse a `409` al hacer este cambio.
+
+---
+
+#### R2-A-04 — US-38 CA-8: chunk con >5 intentos no se marca como `rejected` (QA bug #4 — NO implementado)
+
+**Archivo:** `backend/app/db/queries/compute_queries.py`, función `claim_chunks_atomic`, líneas 165–230
+**Archivo relacionado:** `backend/app/services/consensus_service.py`
+
+**Descripción:**
+El brief (US-38 CA-8) y el QA identifican que un chunk con más de 5 intentos fallidos (`attempts > 5`) debe marcarse automáticamente como `rejected` para evitar que quede atascado en un bucle indefinido de reasignaciones. Esta lógica no existe en ningún lugar del código.
+
+`claim_chunks_atomic` incrementa `attempts` en cada reclamación, pero nunca verifica si el límite fue superado. Un chunk que nunca llega a consenso puede acumular intentos indefinidamente, consumiendo recursos de workers y bloqueando potencialmente la finalización del job padre.
+
+**Corrección:** Añadir en `claim_chunks_atomic` una segunda actualización que marque como `rejected` los chunks que superen el umbral, o añadir una llamada en `process_chunk_submission` después de insertar el resultado: si `chunk["attempts"] > 5` y el chunk sigue sin validarse, marcarlo `rejected` y llamar a `_try_close_job`. Ejemplo de SQL a añadir al final del CTE en `claim_chunks_atomic`:
+
+```sql
+-- Tras el UPDATE principal, rechazar chunks con demasiados intentos:
+UPDATE chunks SET status = 'rejected'
+WHERE job_id IN (SELECT DISTINCT job_id FROM candidates)
+  AND status = 'assigned'
+  AND attempts > 5
+```
+
+O bien añadir la verificación en `process_chunk_submission` antes de devolver la respuesta.
+
+---
+
+#### R2-A-05 — `create_job_with_chunks` no es atómica: job se persiste aunque fallen los chunks
+
+**Archivo:** `backend/app/services/compute_service.py`, líneas 163–186
+
+**Descripción:**
+La secuencia de creación en `create_job_with_chunks` es:
+1. `compute_queries.create_job(...)` — inserta la fila en `jobs` con `status=pending`.
+2. `compute_queries.update_job_status(job_id, "splitting")` — actualiza a `splitting`.
+3. `compute_queries.create_chunks(...)` — inserta N filas en `chunks`.
+4. `compute_queries.update_job_chunks_count(...)` — actualiza `total_chunks`.
+
+Si el paso 3 falla (p.ej. error de BD, payload demasiado grande para jsonb), el job queda en estado `splitting` en la BD sin chunks asociados. No existe ningún mecanismo de rollback: el job permanece "atascado" en `splitting` indefinidamente, aparece en el dashboard del cliente como activo, y nunca puede completarse.
+
+El bloque `except Exception` en las líneas 179–186 captura el error y lanza un 500 al cliente, pero la fila del job ya está persistida en la BD.
+
+**Impacto:** Jobs fantasma en estado `splitting` que nunca progresan ni pueden eliminarse (no hay endpoint DELETE /jobs). Si el cliente reintenta la operación, crea un nuevo job, dejando el anterior corrupto.
+
+**Corrección:** Envolver los pasos 1–4 en una transacción psycopg2 explícita, o añadir lógica de compensación que marque el job como `failed` en el bloque `except`:
+```python
+except Exception as exc:
+    logger.error("Error creando job: %s", exc, exc_info=True)
+    # Compensación: marcar el job como failed si ya fue creado
+    if 'job_id' in locals():
+        try:
+            compute_queries.update_job_status(job_id, "failed")
+        except Exception:
+            pass
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail="Error interno del servidor",
+    )
+```
+
+---
+
+#### R2-A-06 — `claim_chunks_atomic` sobrescribe `assigned_to` con un único proveedor por chunk
+
+**Archivo:** `backend/app/db/queries/compute_queries.py`, líneas 165–230
+**Archivo relacionado:** `migrations/004_compute.sql`, línea 97
+
+**Descripción:**
+El esquema de la tabla `chunks` tiene `assigned_to uuid` — un único UUID. El brief especifica `replicas_needed=2`, lo que significa que dos proveedores distintos deben procesar el mismo chunk.
+
+Cuando el primer proveedor reclama el chunk, `claim_chunks_atomic` hace `SET assigned_to = provider_id_1` y `SET status = 'assigned'`. Cuando el segundo proveedor reclama el mismo chunk (ya en `status=assigned`... pero el query WHERE filtra `status='pending'`), el chunk NO puede ser reclamado por el segundo proveedor porque su status ya no es `pending`. El único mecanismo actual para que el segundo proveedor acceda al chunk es que el primero entregue su resultado y el chunk sea válido — pero si el primer proveedor entrega un resultado y hay `replicas_needed=2`, el chunk queda en `assigned` esperando la segunda réplica sin que ningún worker pueda reclamarlo.
+
+La query SQL de `claim_chunks_atomic` sólo selecciona `WHERE c.status = 'pending'`. Un chunk con `status='assigned'` (asignado al primer proveedor, esperando segunda réplica) es invisible para todos los demás workers. El segundo worker nunca puede reclamar ese chunk.
+
+**Impacto:** El consenso de 2 réplicas nunca puede completarse. Todos los jobs quedan atascados esperando réplicas que nadie puede reclamar. La feature central del brief no funciona correctamente end-to-end.
+
+**Corrección:** Cambiar la condición de elegibilidad en `claim_chunks_atomic` para incluir chunks en estado `pending` O chunks en `assigned` que tengan menos resultados entregados que `replicas_needed`:
+```sql
+WHERE (
+    c.status = 'pending'
+    OR (
+        c.status = 'assigned'
+        AND (
+            SELECT COUNT(*) FROM chunk_results cr2
+            WHERE cr2.chunk_id = c.id
+        ) < c.replicas_needed
+    )
+)
+AND NOT EXISTS (
+    SELECT 1 FROM chunk_results cr
+    WHERE cr.chunk_id = c.id
+      AND cr.provider_id = %(provider_id)s
+)
+```
+Y al hacer el UPDATE, no pisar `assigned_to` si el chunk ya tenía un asignado — o usar una columna `assigned_to_list` (array de UUIDs) si se quiere tracking detallado.
+
+---
+
+### MEDIOS
+
+#### R2-M-01 — `REWARD_PER_CHUNK` definido en tres módulos distintos
+
+**Archivos:**
+- `backend/app/db/queries/compute_queries.py`, línea 22: `REWARD_PER_CHUNK = 0.10`
+- `backend/app/services/compute_service.py`, línea 25: `REWARD_PER_CHUNK = 0.10`
+- `backend/app/services/consensus_service.py`, línea 30: `REWARD_PER_CHUNK = 0.10`
+
+**Descripción:** La constante de recompensa está triplicada. Si el valor cambia en el futuro (decisión de negocio), hay que actualizar tres sitios, con riesgo de inconsistencia.
+
+**Corrección:** Centralizar en `backend/app/core/config.py` o en un módulo `backend/app/core/constants.py` e importar desde allí.
+
+---
+
+#### R2-M-02 — Los ficheros de test nombrados en el encargo no existen con esos nombres
+
+**Descrito en el encargo:** `test_compute_endpoints.py` y `test_compute_service.py`
+**Existente en el repositorio:** `test_compute.py` y `test_consensus.py`
+
+**Descripción:** El encargo de revisión solicita revisar `test_compute_endpoints.py` y `test_compute_service.py`, que no existen. Los tests de endpoints de cómputo están en `test_compute.py` y los del servicio de consenso en `test_consensus.py`. No es un bug funcional, pero indica un desajuste entre la documentación del encargo y la implementación real.
+
+**Corrección:** Renombrar los archivos de test para que coincidan con la convención descrita en los docs de arquitectura, o actualizar el encargo y los comentarios de referencia en los propios tests (que citan `§12.9` pero los nombres de test son `C-01`...`C-05` y `K-01`...`K-07`).
+
+---
+
+#### R2-M-03 — `finalize_job` no transiciona el job por el estado `validating`
+
+**Archivo:** `backend/app/services/compute_service.py`, líneas 246–319
+**Archivo relacionado:** `migrations/004_compute.sql`, línea 45
+
+**Descripción:**
+El schema define el estado `validating` para el job. Sin embargo, `finalize_job` pasa directamente de `processing` a `completed` sin pasar por `validating`. El estado `validating` nunca es asignado a ningún job en el código actual. Los clientes que están haciendo polling de `GET /jobs/{id}` nunca verán el estado `validating` en la UI, haciendo que el badge y la lógica de polling para ese estado sean código muerto.
+
+**Corrección:** Al inicio de `finalize_job`, marcar el job como `validating` mientras se realiza la reducción de resultados, y después marcar como `completed`. Alternativamente, documentar que el estado `validating` está reservado para una implementación futura y ajustar el badge de la UI.
+
+---
+
+#### R2-M-04 — `get_job_result` devuelve `HTTP_400_BAD_REQUEST` cuando el job no está completado
+
+**Archivo:** `backend/app/services/compute_service.py`, líneas 231–234
+
+**Descripción:**
+Cuando se llama a `GET /jobs/{id}/result` y el job está en estado `processing`, el endpoint devuelve 400. Semánticamente, 400 indica "petición malformada del cliente". En este caso la petición es correctamente formada — simplemente el recurso no está disponible aún. El código HTTP más apropiado sería 409 Conflict (el estado actual del recurso impide satisfacer la petición) o 202 Accepted (el procesamiento está en curso).
+
+**Corrección:**
+```python
+raise HTTPException(
+    status_code=status.HTTP_409_CONFLICT,
+    detail=f"El job aún no ha sido completado (estado actual: {job_public.status})",
+)
+```
+
+---
+
+#### R2-M-05 — `JobResultPage.tsx` asume una estructura del resultado que no coincide con `finalize_job`
+
+**Archivo:** `frontend/src/pages/JobResultPage.tsx`, líneas 114–122
+
+**Descripción:**
+La página extrae datos del resultado así:
+```typescript
+const resultData = result.result as Record<string, unknown>
+const operation = typeof resultData.operation === 'string' ? resultData.operation : '—'
+const columnsResult = (
+  typeof resultData.columns === 'object' && resultData.columns !== null
+    ? resultData.columns
+    : {}
+) as Record<string, unknown>
+const tableRows = Object.entries(columnsResult)
+```
+Asume que `result.result` tiene la forma `{ operation: "mean", columns: { col1: 1.5, col2: 3.0 } }`.
+
+Sin embargo, `finalize_job` en `compute_service.py` genera el resultado con la estructura plana:
+`{ "col1_mean": 1.5, "col2_mean": 3.0 }` (claves con sufijo `_<operation>`).
+
+Resultado: `tableRows` siempre estará vacío (la llave `columns` no existe en el objeto real), y la tabla de resultados mostrará el mensaje "No hay datos de columnas disponibles" para todos los jobs completados.
+
+**Impacto:** La página de resultados es funcionalmente inútil — nunca muestra los valores calculados.
+
+**Corrección:** Cambiar la extracción para usar directamente las claves del objeto `result.result`:
+```typescript
+const resultData = result.result as Record<string, unknown>
+const tableRows = Object.entries(resultData).filter(
+  ([key]) => !key.startsWith('__')  // excluir claves internas del reductor
+)
+```
+Y derivar `operation` de los parámetros del job (o de la URL, o del sufijo de las claves del resultado).
+
+---
+
+#### R2-M-06 — `split_csv` no limita el número de columnas ni el tamaño de la fila
+
+**Archivo:** `backend/app/services/compute_service.py`, líneas 48–83
+
+**Descripción:**
+`split_csv` no valida el número de columnas del CSV ni el tamaño de las filas. Un CSV válido con miles de columnas puede crear payloads jsonb extremadamente grandes en `chunks.payload`, superando potencialmente los límites de Supabase/PostgreSQL o causando problemas de memoria durante la serialización.
+
+**Corrección:** Añadir una validación razonable:
+```python
+MAX_COLUMNS = 200
+if len(headers) > MAX_COLUMNS:
+    raise ValueError(f"El CSV no puede tener más de {MAX_COLUMNS} columnas")
+```
+
+---
+
+### BAJOS
+
+#### R2-B-01 — `parseCsvText` en `NewJobPage.tsx` no maneja CSV con comas internas correctamente
+
+**Archivo:** `frontend/src/pages/NewJobPage.tsx`, líneas 45–53
+
+**Descripción:**
+El parser CSV del frontend usa un split naivo por comas: `line.split(',')`. Un campo con comas internas dentro de comillas dobles (ej. `"valor, con coma"`) se partirá incorrectamente. Esto crea una discrepancia entre la vista previa del frontend (columnas y recuento de filas) y lo que realmente procesa el backend con `csv.reader` (que sí maneja el estándar RFC 4180 completo).
+
+**Corrección:** Usar la API `FileReader` junto con una librería CSV válida para el frontend (ej. `papaparse`), o al menos avisar al usuario que los campos con comas internas pueden no mostrarse correctamente en la vista previa.
+
+---
+
+#### R2-B-02 — El worker llama `sys.exit(1)` en fallo de login sin posibilidad de recuperación
+
+**Archivo:** `backend/app/worker/main.py`, líneas 41–48
+
+**Descripción:**
+Si el servidor devuelve un error transitorio (503, timeout, error de red) durante el login inicial, el worker termina con `sys.exit(1)` sin ningún reintento. Para un proceso diseñado para ser resiliente y lanzarse con scripts de múltiples workers, un fallo de login transitorio debería retentarse con backoff.
+
+**Corrección:** Reemplazar `sys.exit(1)` en el login por un mecanismo de reintento con número máximo de intentos configurables, o por lo menos con un reintento inicial antes de terminar.
+
+---
+
+#### R2-B-03 — `statusConfig` y `isInFlight` están duplicados entre `JobDetailPage` y `JobListPage`
+
+**Archivos:**
+- `frontend/src/pages/JobDetailPage.tsx`, líneas 21–49 y 73–79
+- `frontend/src/pages/JobListPage.tsx`, líneas 21–52 y 77–80
+
+**Descripción:** La configuración de badges de estado de job y la función `isInFlight` son casi idénticas en ambas páginas. La única diferencia es que `JobDetailPage` usa etiquetas más largas ("Dividiendo en chunks", "Validando resultados").
+
+**Corrección:** Extraer un hook o módulo `useJobStatus.ts` con la configuración de estados y la función `isInFlight` y reutilizarlo en ambas páginas.
+
+---
+
+#### R2-B-04 — `JobResultPage.tsx` recalcula `rewardTotal` en el cliente en vez de usar el dato del backend
+
+**Archivo:** `frontend/src/pages/JobResultPage.tsx`, línea 129
+
+**Descripción:**
+```typescript
+const rewardTotal = result.total_chunks * 0.1
+```
+El valor `0.1` está hardcodeado. El backend ya calcula y almacena `reward_total` en la tabla `jobs`. El endpoint `GET /jobs/{id}/result` devuelve `JobResultResponse`, que no incluye `reward_total`. Si la recompensa por chunk cambia en el futuro, este cálculo del frontend quedará desincronizado.
+
+**Corrección:** Añadir `reward_total` a `JobResultResponse` en el backend (tanto en el modelo Pydantic como en la función `get_job_result` de `compute_service.py`), actualizar el tipo `JobResultResponse` en `frontend/src/types/compute.ts`, y usar ese valor en la página.
+
+---
+
+#### R2-B-05 — Errores tipográficos menores en las nuevas páginas
+
+**Archivos:**
+- `frontend/src/pages/JobDetailPage.tsx`, línea 193: `"Trabajo completado con exito"` → falta tilde → `"Trabajo completado con éxito"`
+- `frontend/src/pages/JobDetailPage.tsx`, línea 265: `"Operacion"` → `"Operación"`
+- `frontend/src/pages/JobResultPage.tsx`, línea 162: `"Operacion:"` → `"Operación:"`
+- `frontend/src/pages/JobResultPage.tsx`, línea 224: `"Operacion"` → `"Operación"`
+- `frontend/src/pages/JobResultPage.tsx`, línea 243: `"Duracion total"` → `"Duración total"`
+
+**Impacto:** Baja, pero visible en producción para usuarios en español.
+
+---
+
+### INFO
+
+#### R2-INFO-01 — Conexiones psycopg2 sin pool en `compute_queries.py`
+
+**Archivo:** `backend/app/db/queries/compute_queries.py`, líneas 129, 202, 343, 363
+
+Cuatro funciones abren conexiones psycopg2 directas sin pooling: `increment_job_completed_chunks`, `claim_chunks_atomic`, `get_valid_results_for_job`, `count_done_and_rejected_chunks`. Este es el mismo patrón señalado en A-06 de la revisión anterior. Las operaciones atómicas (claim, increment) justifican el uso de psycopg2, pero las de sólo lectura (`get_valid_results_for_job`, `count_done_and_rejected_chunks`) podrían evitar psycopg2 usando el SDK de Supabase con joins.
+
+---
+
+#### R2-INFO-02 — Migración `004_compute.sql` bien diseñada
+
+La migración es idempotente (`IF NOT EXISTS`, `DROP POLICY IF EXISTS`), bien comentada, incluye todas las constraints definidas en el brief, los índices necesarios y documenta explícitamente por qué las políticas de usuario con `auth.uid()` no tienen efecto en el contexto actual. No hay hallazgos de mejora.
+
+---
+
+#### R2-INFO-03 — Sistema de plugins correctamente extensible
+
+La arquitectura `WorkerPlugin` → `DataProcessingPlugin` → registro en `__init__.py` está limpiamente diseñada. Añadir `TranscriptionPlugin` o `RenderPlugin` en el futuro requiere solo crear el módulo y registrar la clase — sin tocar el núcleo del worker. El `SECURITY NOTE` en el docstring de `worker/main.py` documenta correctamente el riesgo de sandbox.
+
+---
+
+### Resumen ejecutivo de esta revisión
+
+| Severidad | Cantidad | IDs |
+|-----------|----------|-----|
+| CRÍTICO   | 3        | R2-C-01, R2-C-02, R2-C-03 |
+| ALTO      | 6        | R2-A-01 a R2-A-06 |
+| MEDIO     | 6        | R2-M-01 a R2-M-06 |
+| BAJO      | 5        | R2-B-01 a R2-B-05 |
+| INFO      | 3        | R2-INFO-01 a R2-INFO-03 |
+| **Total** | **23**   | |
+
+### Estado de los bugs identificados por QA
+
+| Bug QA | Estado | Hallazgo |
+|--------|--------|----------|
+| #1 — HTTP_413_REQUEST_ENTITY_TOO_LARGE deprecado | **NO corregido** | R2-A-01 |
+| #2 — class Config en modelos Pydantic | **NO corregido** | R2-A-02 |
+| #3 — Submit duplicado devuelve 400 en vez de 409 | **NO corregido** | R2-A-03 |
+| #4 — Chunk >5 intentos no se marca como rejected | **NO implementado** | R2-A-04 |
+
+Los 4 bugs identificados por QA siguen sin estar resueltos en el código revisado.
+
+### Veredicto
+
+**RECHAZADO**
+
+La feature no puede mergearse en su estado actual por los siguientes motivos:
+
+1. **R2-C-01** — El frontend no compila. `JobListPage.tsx` tiene referencias a `Link` y `Button` no importados. El build falla antes de llegar a producción.
+
+2. **R2-A-06** — La lógica de réplicas está rota. El mecanismo de consenso con `replicas_needed=2` no puede completarse porque el segundo proveedor nunca puede reclamar un chunk ya en estado `assigned`. La funcionalidad central del brief (consenso distribuido) no es operable.
+
+3. **R2-M-05** — `JobResultPage` siempre muestra "No hay datos disponibles" porque asume una estructura de resultado que no coincide con la que genera el backend.
+
+4. **Los 4 bugs del QA** siguen sin estar corregidos.
+
+### Blockers antes de mergear
+
+Los siguientes hallazgos deben resolverse antes del merge:
+
+1. **R2-C-01** — Añadir imports de `Link` y `Button` en `JobListPage.tsx`.
+2. **R2-A-01** — Cambiar `HTTP_413_REQUEST_ENTITY_TOO_LARGE` → `HTTP_413_CONTENT_TOO_LARGE`.
+3. **R2-A-02** — Migrar `class Config` → `model_config = ConfigDict(from_attributes=True)`.
+4. **R2-A-03** — Cambiar respuesta de submit duplicado de 400 → 409 (y actualizar test K-07).
+5. **R2-A-04** — Implementar rechazo de chunks con >5 intentos.
+6. **R2-A-05** — Añadir compensación de estado `failed` cuando la creación de chunks falla.
+7. **R2-A-06** — Corregir `claim_chunks_atomic` para permitir reclamar chunks con réplicas pendientes.
+8. **R2-M-05** — Corregir `JobResultPage.tsx` para extraer resultados de la estructura real generada por `finalize_job`.
+9. **R2-C-02 / R2-C-03** — Aplicar el fix atómico en `update_wallet_on_task_complete` y añadir manejo de fallos parciales en `_pay_and_update_trust`.
+
+---
+
+### Handoff al Security Auditor — Feature Cómputo Real
+
+Los puntos de seguridad específicos de esta feature que el Security Auditor debe evaluar:
+
+1. **Payload no sanitizado en chunks**: Los datos que los clientes suben (CSV o `params["data"]`) se almacenan directamente en `chunks.payload` (jsonb) y son devueltos a los workers sin ningún filtrado. Un cliente malicioso podría incluir datos diseñados para explotar bugs en el plugin del worker. El brief menciona explícitamente que el sandboxing del worker está fuera de alcance, pero el auditor debe documentar el vector de ataque y su criticidad.
+
+2. **Worker autentica con credenciales en línea de comandos**: El comando `python -m app.worker --email X --password Y` expone credenciales en el historial de shell y en `ps aux`. Verificar que los workers de producción no usen este mecanismo directamente — se necesita inyección por variable de entorno o secret manager.
+
+3. **Sin rate limiting en `POST /work/claim`**: Un atacante autenticado como proveedor puede llamar a `POST /work/claim` con `max_chunks=10` de forma intensiva, reclamando todos los chunks disponibles sin procesarlos realmente, bloqueando a otros workers legítimos. No hay timeout de asignación (los chunks `assigned` nunca se devuelven automáticamente a `pending`).
+
+4. **Sin timeout de asignación de chunks**: Si un worker reclama chunks y luego desaparece (crash, disconnect), esos chunks quedan en estado `assigned` indefinidamente. No hay ningún job scheduler ni TTL que los devuelva a `pending`. Esto también impide que el job llegue a completarse.
+
+5. **`GET /jobs/{id}/result` leakea información de estado**: El endpoint devuelve el estado actual del job en el mensaje de error aunque el job no sea del cliente autenticado — la verificación de ownership se hace correctamente en `get_job_status`, pero vale la pena confirmar que el 403 no filtra información del job ajeno en el `detail`.
+
+6. **Consenso gamificable**: Un proveedor puede registrarse con múltiples cuentas y procesar el mismo chunk dos veces como "réplicas distintas", obteniendo doble recompensa y garantizando consenso artificialmente. La única protección actual es la constraint `UNIQUE (chunk_id, provider_id)` en `chunk_results`, que previene el doble submit con la misma cuenta pero no con cuentas Sybil.

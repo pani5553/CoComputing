@@ -839,3 +839,578 @@ ENVIRONMENT=production
 ```
 
 Verificar que ninguna de estas variables aparece en los logs de CI/CD. Si la plataforma usa GitHub Actions, deben configurarse como `Secrets` de repositorio, no como variables de entorno en texto plano.
+
+---
+
+## Auditoría Feature Cómputo Real — 2026-06-07
+
+**Auditor:** Security Agent  
+**Versión auditada:** commit `4f593f3` (rama `main`)  
+**Alcance:** Feature "Cómputo Real Distribuido" — `backend/app/routers/compute.py`, `backend/app/routers/work.py`, `backend/app/services/compute_service.py`, `backend/app/services/consensus_service.py`, `backend/app/db/queries/compute_queries.py`, `backend/app/worker/main.py`, `backend/app/worker/plugins/data_processing.py`, `backend/app/worker/run_workers.sh`, `migrations/004_compute.sql`
+
+### Resumen de hallazgos de esta sección
+
+| ID | Severidad | Titulo |
+|----|-----------|--------|
+| SEC-19 | CRITICO | Credenciales de produccion reales en `backend/.env` dentro del repositorio |
+| SEC-20 | ALTO | Contrasena del worker expuesta en linea de comandos y en script de demo |
+| SEC-21 | ALTO | Sin rate limiting en `POST /work/claim` — acaparamiento de chunks |
+| SEC-22 | ALTO | Sin timeout de chunks asignados — chunks huerfanos permanentes |
+| SEC-23 | ALTO | Sybil attack en consenso — proveedor con multiples cuentas se auto-valida |
+| SEC-24 | ALTO | Race condition en pago de recompensas por chunk (`credit_reward`) |
+| SEC-25 | MEDIO | CSV sin sanitizacion de encabezados llega al worker como nombres de columna |
+| SEC-26 | MEDIO | DoS por creacion masiva de jobs y chunks sin limite por usuario |
+| SEC-27 | MEDIO | Proveedor puede ver payload completo de chunks (datos del cliente) |
+| SEC-28 | MEDIO | Sin validacion de `operation` en el payload del chunk |
+| SEC-29 | MEDIO | Sin aislamiento del worker — plugin ejecuta en el mismo proceso sin sandbox |
+| SEC-30 | BAJO | `max_chunks` sin limite en `ClaimRequest` permite reclamar 10 chunks por ciclo |
+| SEC-31 | BAJO | `duration_ms` controlado por el proveedor — dato no confiable en metricas |
+| SEC-32 | BAJO | RLS de tablas nuevas replica el patron de bypass total de la auditoria anterior |
+
+---
+
+### SEC-19 — Credenciales de produccion reales expuestas en `backend/.env`
+
+**Severidad: CRITICO**  
+**CWE:** CWE-312 (Cleartext Storage of Sensitive Information), CWE-798 (Use of Hard-coded Credentials)  
+**Archivo:** `backend/.env` (presente en disco; el `.gitignore` lo excluye correctamente, pero el archivo existe con credenciales reales)
+
+**Descripcion:**
+
+El archivo `backend/.env` contiene credenciales activas de produccion:
+
+- `SUPABASE_SERVICE_ROLE_KEY`: JWT de rol `service_role` del proyecto `tgziidtkkhxkmhdydwkg` (Supabase), activo hasta 2096. Con esta clave cualquier atacante tiene acceso completo de lectura y escritura a toda la base de datos, bypasseando RLS.
+- `SUPABASE_DB_URL`: cadena de conexion PostgreSQL con usuario `postgres.tgziidtkkhxkmhdydwkg` y contrasena en texto plano `Valdeecanada1`, apuntando al pooler de produccion en `aws-0-eu-west-1`.
+- `JWT_SECRET_KEY`: clave de 64 caracteres hexadecimales usada para firmar todos los JWT de la plataforma.
+
+El `.gitignore` del repositorio excluye `.env` correctamente, por lo que este archivo no deberia estar trackeado por git. Sin embargo, su mera existencia en el repositorio local con contenido real representa un riesgo critico de filtracion si alguien accede a la maquina de desarrollo, si el archivo fue committado accidentalmente en algun momento (verificable con `git log --all -- backend/.env`) o si se incluye inadvertidamente en un artefacto de build o log.
+
+**Vector de ataque:**
+
+Un atacante con acceso a la maquina de desarrollo, al historial git, a logs de CI/CD o a un artefacto de build que incluya el `.env` obtiene acceso total a la base de datos y puede forjar tokens JWT validos para cualquier cuenta.
+
+**Impacto:** Compromiso total de la plataforma: lectura y escritura sin restriccion en todos los datos, capacidad de suplantar cualquier usuario, acceso a saldos y transacciones.
+
+**Mitigacion concreta:**
+
+1. Rotar INMEDIATAMENTE en Supabase: regenerar la `service_role key` y cambiar la contrasena de la conexion directa `SUPABASE_DB_URL`. El `JWT_SECRET_KEY` actual puede mantenerse si se confirma que el `.env` nunca fue commiteado, pero es recomendable rotarlo tambien.
+2. Verificar el historial git: `git log --all --full-history -- backend/.env` y `git log --all --full-history -- "**/.env"`. Si aparece algun commit, usar `git filter-repo` para eliminar el secreto del historial y forzar un push.
+3. Nunca almacenar credenciales reales en archivos `.env` del repositorio local. Usar un gestor de secretos (1Password Secrets Automation, Vault, AWS Secrets Manager) o variables de entorno del sistema operativo.
+4. Añadir un hook de pre-commit (p.ej. `gitleaks` o `detect-secrets`) que rechace commits con patrones de credenciales.
+
+---
+
+### SEC-20 — Contrasena del worker expuesta en linea de comandos y en script de demo
+
+**Severidad: ALTO**  
+**CWE:** CWE-214 (Invocation of Process Using Visible Sensitive Information)  
+**Archivos:** `backend/app/worker/main.py` linea 166, `backend/app/worker/run_workers.sh` linea 14
+
+**Descripcion:**
+
+El CLI del worker acepta la contrasena mediante `--password` como argumento posicional:
+
+```
+python -m app.worker --api http://localhost:8000 --email X --password Y
+```
+
+Los argumentos de proceso son visibles en:
+- `ps aux` o `/proc/<pid>/cmdline` en Linux — cualquier usuario del sistema puede leerlos.
+- Logs de shell history (`~/.bash_history`, `~/.zsh_history`).
+- Logs de herramientas de orquestacion (systemd, supervisord, Docker Compose) que registran el comando completo.
+
+El script `run_workers.sh` ademas fija la contrasena con el valor por defecto `password123` hardcodeado en la variable `WORKER_PASSWORD`.
+
+**Vector de ataque:**
+
+Un usuario no privilegiado del mismo servidor ejecuta `ps aux | grep worker` y obtiene las credenciales de todos los workers activos. Con ellas puede autenticarse como proveedor y acaparar chunks o enviar resultados fraudulentos.
+
+**Impacto:** Compromiso de las cuentas de worker. Un atacante puede reclamar chunks, entregar resultados incorrectos y cobrar recompensas fraudulentas.
+
+**Mitigacion concreta:**
+
+1. Leer la contrasena desde una variable de entorno en lugar de argumento CLI:
+   ```python
+   # En main() — eliminar --password como argumento
+   import os
+   password = os.environ.get("WORKER_PASSWORD")
+   if not password:
+       parser.error("Se requiere la variable de entorno WORKER_PASSWORD")
+   ```
+2. En `run_workers.sh`, nunca poner el valor por defecto `password123`. Exigir que `WORKER_PASSWORD` este definida en el entorno antes de ejecutar el script.
+3. A largo plazo: reemplazar autenticacion por contrasena del worker por un token de API de larga duracion (`API_KEY`) generado por el sistema y almacenado en un gestor de secretos.
+
+**Estado actual:** PENDIENTE — confirmado en codigo.
+
+---
+
+### SEC-21 — Sin rate limiting en `POST /work/claim` — acaparamiento de chunks
+
+**Severidad: ALTO**  
+**CWE:** CWE-400 (Uncontrolled Resource Consumption), CWE-306 (Missing Authentication for Critical Function)  
+**Archivo:** `backend/app/routers/work.py` linea 21
+
+**Descripcion:**
+
+El endpoint `POST /work/claim` no tiene ninguna restriccion de tasa de peticiones por proveedor. Un proveedor malicioso puede llamar al endpoint en bucle cerrado con `max_chunks=10` (limite del modelo) acaparando sistematicamente todos los chunks disponibles. El modelo `ClaimRequest` acepta hasta 10 chunks por peticion, y no hay limite de frecuencia de peticiones ni cuota maxima de chunks asignados simultaneamente a un mismo proveedor.
+
+**Vector de ataque:**
+
+Un proveedor lanza 100 peticiones concurrentes a `POST /work/claim`. Aunque el claim atomico con `FOR UPDATE SKIP LOCKED` garantiza que no hay duplicados, un solo proveedor puede reclamar todos los chunks disponibles antes de que otros trabajadores lleguen a hacer polling, monopolizando el sistema y pudiendo luego no entregarlos (o entregar resultados maliciosos sin competencia para el consenso).
+
+**Impacto:** Un proveedor con multiples conexiones paralelas puede acaparar todos los chunks de un job, eliminando la distribucion real del computo y comprometiendo el modelo de consenso (necesita un segundo proveedor distinto para validar).
+
+**Mitigacion concreta:**
+
+1. Aplicar rate limiting por `provider_id` autenticado (no por IP, ya que multiples workers legitimos podrian estar detras del mismo NAT) usando `slowapi`:
+   ```python
+   # work.py
+   @router.post("/claim", response_model=ClaimResponse)
+   @limiter.limit("30/minute", key_func=lambda request: str(request.state.provider_id))
+   def claim_chunks(...):
+   ```
+2. Anadir una columna `max_concurrent_chunks` en la tabla `providers` o un limite global configurable (p.ej. maximo 20 chunks asignados a un proveedor al mismo tiempo), verificado en `claim_chunks_atomic`.
+3. En la query SQL de claim, anadir la condicion:
+   ```sql
+   AND (SELECT COUNT(*) FROM chunks WHERE assigned_to = %(provider_id)s AND status = 'assigned') < %(max_concurrent)s
+   ```
+
+**Estado actual:** PENDIENTE — el Code Reviewer lo identifico, no hay mitigacion en codigo.
+
+---
+
+### SEC-22 — Sin timeout de chunks asignados — chunks huerfanos permanentes
+
+**Severidad: ALTO**  
+**CWE:** CWE-400 (Uncontrolled Resource Consumption), CWE-703 (Improper Check for Exceptional Conditions)  
+**Archivo:** `backend/app/db/queries/compute_queries.py` linea 168
+
+**Descripcion:**
+
+Cuando un worker reclama un chunk (estado `assigned`) y luego falla (crash, perdida de red, desconexion), el chunk permanece en estado `assigned` indefinidamente. No existe ningun mecanismo que libere los chunks asignados tras un timeout.
+
+La mitigacion parcial `MAX_CHUNK_ATTEMPTS=5` en `claim_chunks_atomic` solo previene que chunks con muchos intentos sigan recibiendo asignaciones, pero no libera chunks que estan actualmente en estado `assigned` sin ser procesados. El codigo del worker tiene logica de retry de claim pero no de liberacion activa de chunks asignados.
+
+**Vector de ataque (pasivo — no requiere atacante):**
+
+Un worker con 3 chunks asignados sufre un crash. Esos 3 chunks quedan en `assigned` sin que ningun otro worker pueda reclamarlos. Si el job tiene pocos chunks, puede quedar en `processing` para siempre sin progresar, resultando en un job "zombie" que nunca completa.
+
+**Impacto:** Jobs que nunca terminan. Degradacion del servicio para los clientes. Chunks de datos de usuario atrapados sin procesar.
+
+**Mitigacion concreta:**
+
+Anadir una columna `assigned_at timestamptz` en la tabla `chunks` (o reusar `created_at` con cautela). Crear un job de mantenimiento (puede ser una funcion PostgreSQL invocada cada N minutos por un scheduled job de Supabase) que resetee a `pending` los chunks que llevan mas de X minutos en `assigned`:
+
+```sql
+-- Funcion de cleanup (ejecutar periodicamente, p.ej. cada 5 minutos)
+UPDATE chunks
+SET status = 'pending',
+    assigned_to = NULL
+WHERE status = 'assigned'
+  AND assigned_at < NOW() - INTERVAL '10 minutes';
+```
+
+Alternativamente, implementarlo como endpoint interno `POST /internal/cleanup-stale-chunks` llamado por un cron externo o por el scheduler del propio backend.
+
+**Estado actual:** PARCIALMENTE MITIGADO — `MAX_CHUNK_ATTEMPTS=5` evita loops infinitos de reintento pero no libera chunks actualmente atascados en `assigned`. El timeout real sigue pendiente.
+
+---
+
+### SEC-23 — Sybil attack en consenso — proveedor con multiples cuentas se auto-valida
+
+**Severidad: ALTO**  
+**CWE:** CWE-284 (Improper Access Control), CWE-345 (Insufficient Verification of Data Authenticity)  
+**Archivo:** `backend/app/services/consensus_service.py` lineas 197-228
+
+**Descripcion:**
+
+El mecanismo de consenso requiere que 2 proveedores distintos entreguen el mismo resultado para que un chunk sea marcado como `done` y se pague la recompensa. Sin embargo, no existe ninguna verificacion de que los proveedores sean entidades distintas en el mundo real. Un atacante puede registrar 2 (o 3) cuentas de proveedor y operar todos los workers asociados, reclamando el mismo chunk con ambas cuentas y enviando resultados coordinados (posiblemente incorrectos). El sistema considerara que hay consenso y pagara a ambas cuentas.
+
+La unica proteccion existente es la constraint `UNIQUE (chunk_id, provider_id)` en `chunk_results`, que impide que la misma cuenta entregue dos veces el mismo chunk. Pero con dos cuentas distintas bajo el mismo control, el atacante tiene acceso completo al proceso de validacion.
+
+**Vector de ataque:**
+
+1. El atacante registra `worker_a@example.com` y `worker_b@example.com`.
+2. Ambos workers reclaman el mismo chunk (gracias a `replicas_needed=2`).
+3. El atacante controla el resultado que envia cada worker — puede enviar resultados incorrectos que coincidan entre si.
+4. El consenso valida el chunk y paga a ambas cuentas.
+5. El cliente recibe un resultado incorrecto.
+
+**Impacto:** Los clientes reciben resultados de computo incorrectos sin posibilidad de detectarlo. Los proveedores maliciosos cobran recompensas por trabajo invalido. El trust score no captura el fraude porque el consenso lo marca como valido.
+
+**Mitigacion concreta:**
+
+1. A corto plazo (MVP): limitar el numero de chunks activos que puede reclamar un mismo rango de IPs o una misma subnet en el mismo job. No es perfecto pero eleva el coste del ataque.
+2. A medio plazo: implementar un sistema de identidad de worker ligero — al registrarse, el proveedor declara su hardware (CPU/GPU/RAM ya registrados); el sistema puede verificar que dos workers con el mismo hardware fingerprint no procesen el mismo chunk.
+3. A largo plazo: Proof of Work o challenge-response para verificacion de identidad de worker antes de permitir claims. Requiere rediseno del protocolo.
+4. Documentar explicitamente en el brief y en el sistema que el consenso actual NO protege contra Sybil attacks de primer nivel.
+
+**Estado actual:** PENDIENTE — el Code Reviewer lo identifico. No hay ninguna mitigacion en codigo.
+
+---
+
+### SEC-24 — Race condition en pago de recompensas por chunk (`credit_reward`)
+
+**Severidad: ALTO**  
+**CWE:** CWE-362 (Concurrent Execution using Shared Resource with Improper Synchronization)  
+**Archivo:** `backend/app/services/wallet_service.py` lineas 106-125, `backend/app/services/consensus_service.py` lineas 215-218
+
+**Descripcion:**
+
+La funcion `_pay_and_update_trust` en `consensus_service.py` llama a `wallet_service.credit_reward` para cada proveedor que ha enviado un resultado valido. El patron de escritura en `credit_reward` hereda el mismo defecto identificado en SEC-01: `update_wallet_on_task_complete` lee el saldo actual, calcula el nuevo valor en Python y escribe con un UPDATE simple sin atomicidad garantizada.
+
+En el caso de un job con muchos chunks que se validan simultaneamente (escenario realista con varios workers en paralelo), multiples llamadas concurrentes a `credit_reward` para el mismo `provider_id` pueden resultar en perdida de recompensas (si dos escrituras se superponen, una sobreescribe a la otra).
+
+**Vector de ataque (escenario de perdida no intencional):**
+
+Un proveedor valida 5 chunks en un intervalo de menos de 100ms. Las 5 llamadas a `credit_reward` leen el saldo inicial, calculan incrementos en paralelo y escriben. En lugar de acumular 5 x 0.10 CC = 0.50 CC, el saldo final puede ser solo 0.10 CC (la ultima escritura gana).
+
+**Impacto:** Perdida economica para proveedores honestos. Inconsistencia entre el numero de chunks validados y el saldo real acreditado. Dificil de detectar sin reconciliacion manual.
+
+**Mitigacion concreta:**
+
+Usar una operacion atomica en SQL para el credito de recompensa, similar a la mitigacion de SEC-01:
+
+```sql
+UPDATE wallets
+SET available_balance = available_balance + %s,
+    total_earned      = total_earned + %s,
+    updated_at        = now()
+WHERE provider_id = %s
+RETURNING *
+```
+
+Esta operacion es segura porque PostgreSQL serializa los UPDATEs sobre la misma fila mediante bloqueo de fila.
+
+**Estado actual:** PENDIENTE — el mismo patron defectuoso identificado en SEC-01 se replica en el nuevo flujo de computo.
+
+---
+
+### SEC-25 — CSV sin sanitizacion de encabezados — nombres de columna controlados por el cliente
+
+**Severidad: MEDIO**  
+**CWE:** CWE-20 (Improper Input Validation)  
+**Archivos:** `backend/app/services/compute_service.py` lineas 54-83, `backend/app/worker/plugins/data_processing.py` linea 53
+
+**Descripcion:**
+
+La funcion `split_csv` en `compute_service.py` extrae los encabezados del CSV del cliente sin ninguna sanitizacion:
+
+```python
+headers = [h.strip() for h in headers]
+```
+
+Estos encabezados se incluyen directamente en el payload del chunk (`"columns": headers`) y llegan al worker, donde se usan como nombres de schema en polars (`pl.DataFrame(data=rows, schema=columns, orient="row")`) y como claves del resultado devuelto al servidor.
+
+**Vectores de riesgo:**
+
+1. Un cliente sube un CSV con encabezados que contienen caracteres especiales (`\n`, `\t`, comillas, caracteres Unicode de control). Polars puede lanzar excepciones inesperadas que el worker captura como `{"error": "..."}` y envia de vuelta, exponiendo detalles del entorno del worker en la respuesta de la API.
+2. Si en el futuro se usa el nombre de columna en una consulta SQL construida dinamicamente (ej. en un nuevo tipo de operacion), el encabezado sin sanitizar se convierte en un vector de inyeccion SQL.
+3. Los nombres de columna llegaran al resultado final (`finalize_job`) y se almacenaran en `jobs.result` (JSONB). Si el frontend renderiza estas claves sin escapar, es un vector de XSS almacenado.
+
+**Mitigacion concreta:**
+
+Sanitizar encabezados en `split_csv` antes de usarlos:
+
+```python
+import re
+
+def _sanitize_column_name(name: str) -> str:
+    # Permitir solo alfanumericos, guion bajo y guion
+    sanitized = re.sub(r'[^\w\-]', '_', name.strip(), flags=re.UNICODE)
+    # Asegurar que no empieza por digito
+    if sanitized and sanitized[0].isdigit():
+        sanitized = f"col_{sanitized}"
+    return sanitized[:64]  # limite de longitud
+
+headers = [_sanitize_column_name(h) for h in headers]
+```
+
+Ademas, validar que el numero de columnas no supere un maximo razonable (p.ej. 200 columnas) para prevenir payloads excesivamente grandes.
+
+**Estado actual:** PENDIENTE — el Code Reviewer lo identifico. Solo hay un `.strip()` basico.
+
+---
+
+### SEC-26 — DoS por creacion masiva de jobs y chunks sin limite por usuario
+
+**Severidad: MEDIO**  
+**CWE:** CWE-400 (Uncontrolled Resource Consumption), CWE-770 (Allocation of Resources Without Limits or Throttling)  
+**Archivo:** `backend/app/routers/compute.py` lineas 36-118
+
+**Descripcion:**
+
+El endpoint `POST /jobs` no tiene:
+
+1. Limite de jobs activos por usuario: un cliente puede crear N jobs simultaneamente, cada uno generando miles de chunks.
+2. Limite de tamano de datos inline: el campo `params["data"]` acepta `list[list[Any]]` sin restriccion de tamano. Un cliente puede enviar 100 MB de datos JSON inline (el limite de 10 MB solo aplica al upload multipart/CSV, no al path JSON).
+3. Rate limiting: sin `slowapi` ni limite de frecuencia en `POST /jobs`.
+
+Con `CHUNK_SIZE = 500` filas y un CSV de 10 MB (el maximo permitido por el upload), un job puede generar hasta ~20.000 chunks para un CSV de datos densos. Multiplicado por N jobs concurrentes, la tabla `chunks` puede crecer a millones de filas rapidamente.
+
+**Escenario de ataque:**
+
+Un cliente autenticado envia 100 peticiones POST /jobs con `params["data"]` de 50.000 filas inline (sin pasar por el limite de 10 MB del CSV). El backend genera 100 * 100 = 10.000 chunks, satura la tabla y bloquea el sistema para todos los demas usuarios.
+
+**Mitigacion concreta:**
+
+1. Limitar el numero de jobs activos por cliente (p.ej. max 5 jobs en estado `processing`):
+   ```python
+   active_jobs = compute_queries.count_active_jobs_by_client(client_id)
+   if active_jobs >= MAX_ACTIVE_JOBS_PER_CLIENT:
+       raise HTTPException(status_code=429, detail="Limite de jobs activos alcanzado")
+   ```
+2. Limitar el tamano del body JSON en el path inline (anadir validacion en `JobCreateRequest`):
+   ```python
+   data: list[list[Any]] = Field(..., max_length=100_000)  # max 100k filas inline
+   ```
+3. Aplicar rate limiting con `slowapi` en `POST /jobs`: p.ej. `5/minute` por usuario autenticado.
+
+**Estado actual:** PENDIENTE.
+
+---
+
+### SEC-27 — Proveedor puede ver el payload completo de chunks (datos del cliente)
+
+**Severidad: MEDIO**  
+**CWE:** CWE-200 (Exposure of Sensitive Information to an Unauthorized Actor)  
+**Archivos:** `backend/app/routers/work.py` lineas 32-43, `backend/app/db/queries/compute_queries.py` linea 213
+
+**Descripcion:**
+
+Cuando un worker llama a `POST /work/claim`, recibe el campo `payload` del chunk, que contiene las filas de datos del CSV del cliente (`{"rows": [[...]], "columns": [...], "operation": "...", "target_columns": [...]}`). Este es el comportamiento esperado para que el worker pueda procesar el computo.
+
+Sin embargo, no existe ninguna restriccion sobre a que jobs puede acceder un proveedor. La query `claim_chunks_atomic` selecciona chunks de cualquier job en estado `pending`, sin filtrar por ningun criterio de autorizacion del proveedor respecto al cliente que subio los datos. El cliente no puede configurar que sus datos solo sean procesados por proveedores de un determinado trust score o ubicacion geografica.
+
+Esto implica que los datos del CSV (que pueden ser datos sensibles del negocio del cliente: ventas, datos de empleados, metricas financieras) se exponen a cualquier proveedor autenticado en la plataforma.
+
+**Impacto:** Los datos de los clientes son accesibles por cualquier proveedor activo. No hay mecanismo de consentimiento, cifrado de payload ni segmentacion de datos.
+
+**Mitigacion concreta (segun nivel de proteccion deseado):**
+
+1. Minima (MVP): documentar en los terminos de servicio que los datos subidos son procesados por proveedores de la red. Anadir un aviso en el UI antes de subir el CSV.
+2. Media: filtrar proveedores elegibles para un job segun `trust_score >= umbral` definido por el cliente en los `params` del job. Anadir la condicion en `claim_chunks_atomic`.
+3. Alta (no MVP): cifrar los payloads en reposo con una clave derivada por job, y entregar la clave de descifrado al worker junto con el chunk (TEE o mecanismo de key delivery). Requiere rediseno significativo.
+
+**Estado actual:** ACEPTADO COMO RIESGO DE MVP segun `briefs/02-computo-real.md` (seccion "Fuera de alcance: Sandboxing/aislamiento de seguridad del worker — documenta el riesgo en seguridad"). Debe documentarse explicitamente en terminos de servicio.
+
+---
+
+### SEC-28 — Sin validacion de `operation` en el payload del chunk en el worker
+
+**Severidad: MEDIO**  
+**CWE:** CWE-20 (Improper Input Validation)  
+**Archivo:** `backend/app/worker/plugins/data_processing.py` lineas 66-77
+
+**Descripcion:**
+
+El campo `operation` del payload del chunk llega al worker y se usa como selector de logica en `_process_with_polars` y `_process_stdlib`. Los valores aceptados de facto son `mean`, `sum`, `min`, `max`, `count`. Cualquier otro valor no se rechaza con un error, sino que silenciosamente cae en el `else` y ejecuta `mean`.
+
+El problema no es la ejecucion de codigo arbitrario (no hay `eval` ni `exec`), sino que:
+1. Un servidor API comprometido o un bug en `compute_service.py` podria entregar un `operation` inesperado al worker.
+2. Si se extiende el sistema con nuevas operaciones que si tienen implicaciones de seguridad (ej. operaciones que acceden al sistema de archivos), un payload malicioso podria triggear la logica incorrecta.
+
+En la validacion del lado servidor, `compute_service.py` no valida que `params["operation"]` sea uno de los valores permitidos antes de incluirlo en el payload del chunk.
+
+**Mitigacion concreta:**
+
+1. En el servidor, validar `operation` en `JobCreateRequest` o en `create_job_with_chunks`:
+   ```python
+   ALLOWED_OPERATIONS = {"mean", "sum", "min", "max", "count"}
+   operation = params.get("operation", "mean")
+   if operation not in ALLOWED_OPERATIONS:
+       raise HTTPException(400, detail=f"Operacion no soportada: {operation}")
+   ```
+2. En el worker plugin, validar explicitamente y lanzar excepcion si la operacion no es conocida en lugar de silenciar con el default:
+   ```python
+   if operation not in ("mean", "sum", "min", "max", "count"):
+       raise ValueError(f"Operacion no soportada: {operation}")
+   ```
+
+**Estado actual:** PENDIENTE.
+
+---
+
+### SEC-29 — Sin aislamiento del worker — plugin ejecuta en el mismo proceso sin sandbox
+
+**Severidad: MEDIO**  
+**CWE:** CWE-693 (Protection Mechanism Failure)  
+**Archivos:** `backend/app/worker/main.py` (docstring lineas 13-16), `backend/app/worker/plugins/data_processing.py`
+
+**Descripcion:**
+
+El worker ejecuta el computo del chunk en el mismo proceso Python, sin ninguna forma de aislamiento (no hay subprocess, no hay Docker-in-Docker, no hay seccomp, no hay AppArmor). El propio `main.py` documenta este riesgo en su docstring:
+
+> "SECURITY NOTE: The worker executes payloads from the server without sandboxing. [...] Do NOT run this worker against untrusted API endpoints in production without adding proper isolation."
+
+Para el plugin actual `data_processing`, el riesgo de RCE es bajo porque el plugin:
+- No usa `eval`, `exec` ni `subprocess`.
+- Procesa unicamente datos tabulares (listas de listas de valores primitivos).
+- Usa polars o stdlib `statistics`, sin deserializacion de objetos arbitrarios.
+
+Sin embargo, el riesgo existe en dos vectores:
+
+1. **Servidor comprometido:** si la API devuelve un payload de chunk manipulado, el plugin procesa datos del atacante. Polars tiene su propia superficie de vulnerabilidades (crashes, consumo de memoria excesivo con DataFrames patologicos).
+2. **Futuros plugins:** el sistema de plugins (`WorkerPlugin`) esta disenado para extensibilidad. Un futuro plugin de transcripcion de audio o rendering que invoque herramientas externas (`ffmpeg`, `blender`) seria un vector de RCE si los datos del payload no se validan estrictamente antes de pasarlos como argumentos a subprocess.
+
+**Impacto para MVP actual:** BAJO — el plugin actual no ejecuta codigo arbitrario. El riesgo es de crash o consumo de recursos por datos malformados.  
+**Impacto futuro:** CRITICO si se anade cualquier plugin que invoque procesos externos sin sandboxing.
+
+**Mitigacion concreta:**
+
+1. Para el MVP: anadir limites de recursos en el worker (max filas por chunk, max columnas, max tamano de celda) que se verifican antes de pasar los datos a polars.
+2. Para produccion: ejecutar cada worker en un contenedor Docker con perfil seccomp restrictivo (`--security-opt seccomp=profile.json`), sin acceso a red (excepto al endpoint de la API), con filesystem de solo lectura.
+3. Documentar en el README del worker los requisitos de aislamiento para despliegue en produccion.
+
+**Estado actual:** ACEPTADO COMO RIESGO DE MVP segun `briefs/02-computo-real.md`. El riesgo inmediato es bajo con el plugin actual. Requiere accion antes de anadir plugins que invoquen procesos externos.
+
+---
+
+### SEC-30 — `max_chunks` sin validacion critica — 10 chunks por ciclo sin freno adicional
+
+**Severidad: BAJO**  
+**CWE:** CWE-770 (Allocation of Resources Without Limits or Throttling)  
+**Archivo:** `backend/app/models/compute.py` lineas 59-60
+
+**Descripcion:**
+
+`ClaimRequest` valida `max_chunks` en el rango `[1, 10]`. El limite de 10 es razonable para uso legitimo pero no esta vinculado a ninguna politica de negocio documentada. Sin rate limiting (SEC-21), un proveedor puede llamar 60 veces por minuto a `/work/claim` con `max_chunks=10`, reclamando hasta 600 chunks por minuto de un solo proveedor.
+
+**Mitigacion:** El limite de 10 es correcto. La mitigacion real es SEC-21 (rate limiting en el endpoint). Una vez aplicado el rate limiting, este hallazgo queda residual.
+
+**Estado actual:** PENDIENTE (dependiente de SEC-21).
+
+---
+
+### SEC-31 — `duration_ms` controlado por el proveedor — dato no confiable
+
+**Severidad: BAJO**  
+**CWE:** CWE-346 (Origin Validation Error)  
+**Archivo:** `backend/app/models/compute.py` linea 71, `backend/app/db/queries/compute_queries.py` linea 316
+
+**Descripcion:**
+
+El campo `duration_ms` en `SubmitRequest` es reportado por el proveedor y se almacena sin modificacion en `chunk_results.duration_ms`. Si este campo se usa en el futuro para calcular el `response_time_score` del proveedor o para optimizar la asignacion de chunks, un proveedor malicioso puede reportar duraciones artificialmente bajas (1 ms) para mejorar su score sin haber procesado el trabajo en tiempo real.
+
+La unica validacion existente es `gt=0` (mayor que cero).
+
+**Mitigacion concreta:**
+
+1. Anadir un limite superior razonable: `duration_ms: int = Field(..., gt=0, le=3_600_000)` (max 1 hora).
+2. El backend puede calcular independientemente el tiempo de procesamiento aproximado como `submit_time - assigned_at` y usarlo para detectar anomalias (proveedores que reportan 1 ms pero el delta real es 10 segundos).
+3. Marcar explicitamente en el modelo y en la documentacion que `duration_ms` es un dato auto-reportado no verificado.
+
+**Estado actual:** PENDIENTE — mejora de calidad de datos, no un riesgo de seguridad inmediato.
+
+---
+
+### SEC-32 — RLS de tablas nuevas replica el patron de bypass total
+
+**Severidad: BAJO**  
+**CWE:** CWE-284 (Improper Access Control)  
+**Archivo:** `migrations/004_compute.sql` lineas 199-229
+
+**Descripcion:**
+
+La migracion `004_compute.sql` activa RLS en las tres tablas nuevas (`jobs`, `chunks`, `chunk_results`) y define dos capas de politicas: una permisiva para `service_role` y otra para usuarios finales basada en `auth.uid()`. Sin embargo, como se documenta en el propio archivo SQL y en SEC-05 de la auditoria anterior, `auth.uid()` retorna `NULL` en sesiones del backend porque el JWT es HS256 propio y no pasa por Supabase Auth. Las politicas de usuario (`jobs_select_own`, `chunk_results_select_own`, etc.) no tienen efecto real en el MVP.
+
+Ademas, la politica `chunks_select_job_owner` esta simplificada intencionalmente:
+```sql
+USING (auth.role() IN ('authenticated', 'service_role'));
+```
+Esto permitiria a cualquier usuario autenticado leer cualquier chunk directamente desde Supabase si se usase la anon key (aunque el backend no la expone).
+
+**Impacto:** Replica exactamente el riesgo de SEC-05. La unica capa de control de acceso es el codigo FastAPI. Un bug en cualquier endpoint expone datos sin red de seguridad en la BD.
+
+**Mitigacion:** Idem SEC-05 — planificar la migracion a Supabase Auth o a un mecanismo de `SET LOCAL app.current_provider_id` para que las politicas RLS tengan efecto real.
+
+**Estado actual:** ACEPTADO COMO DEUDA TECNICA (documentado en la migracion). Consistente con el patron del MVP actual.
+
+---
+
+## Resumen Ejecutivo — Feature Cómputo Real
+
+### Tabla de severidad consolidada (hallazgos nuevos)
+
+| ID | Severidad | Titulo | Estado |
+|----|-----------|--------|--------|
+| SEC-19 | CRITICO | Credenciales de produccion en `backend/.env` | PENDIENTE |
+| SEC-20 | ALTO | Contrasena del worker en CLI | PENDIENTE |
+| SEC-21 | ALTO | Sin rate limiting en `/work/claim` | PENDIENTE |
+| SEC-22 | ALTO | Sin timeout de chunks asignados | PARCIALMENTE MITIGADO |
+| SEC-23 | ALTO | Sybil attack en consenso | PENDIENTE |
+| SEC-24 | ALTO | Race condition en `credit_reward` | PENDIENTE |
+| SEC-25 | MEDIO | CSV sin sanitizacion de encabezados | PENDIENTE |
+| SEC-26 | MEDIO | DoS por jobs/chunks masivos | PENDIENTE |
+| SEC-27 | MEDIO | Datos del cliente visibles al proveedor | ACEPTADO (MVP) |
+| SEC-28 | MEDIO | Sin validacion de `operation` en el worker | PENDIENTE |
+| SEC-29 | MEDIO | Worker sin sandbox | ACEPTADO (MVP) |
+| SEC-30 | BAJO | Limite de max_chunks sin rate limiting de respaldo | PENDIENTE (depende SEC-21) |
+| SEC-31 | BAJO | `duration_ms` auto-reportado sin limite superior | PENDIENTE |
+| SEC-32 | BAJO | RLS nuevo replica bypass total | ACEPTADO (deuda tecnica) |
+
+### Verificacion de hallazgos del Code Reviewer anterior
+
+| # | Hallazgo del Code Reviewer | Verificado en codigo | Severidad asignada |
+|---|---------------------------|---------------------|--------------------|
+| 1 | Sin chunk assignment timeout | CONFIRMADO — `MAX_CHUNK_ATTEMPTS=5` existe pero no hay timeout de `assigned` | ALTO (SEC-22) |
+| 2 | Sin rate limiting en `/work/claim` | CONFIRMADO — no hay ninguna restriccion | ALTO (SEC-21) |
+| 3 | Credenciales worker en CLI `--password` | CONFIRMADO — argumento posicional en `main.py` y `run_workers.sh` | ALTO (SEC-20) |
+| 4 | Sybil attack en consenso | CONFIRMADO — sin verificacion de identidad real | ALTO (SEC-23) |
+| 5 | CSV sin sanitizar llega al worker | CONFIRMADO — solo `.strip()` en encabezados | MEDIO (SEC-25) |
+
+---
+
+## Handoff para DevOps — Feature Cómputo Real
+
+### Acciones bloqueantes pre-deploy (CRITICO/ALTO — deben resolverse antes de ir a produccion)
+
+**URGENTE INMEDIATO — SEC-19 — Credenciales de produccion en `backend/.env`**
+
+El archivo `backend/.env` contiene la `SUPABASE_SERVICE_ROLE_KEY` activa, la contrasena de la base de datos PostgreSQL y el `JWT_SECRET_KEY` de produccion. Aunque el `.gitignore` lo excluye correctamente, el riesgo de filtracion por acceso a la maquina de desarrollo o por inclusion accidental en artefactos es CRITICO.
+
+Acciones inmediatas:
+1. Verificar con `git log --all --full-history -- backend/.env` que el archivo nunca fue committado.
+2. Rotar en Supabase Dashboard: regenerar `service_role key` y cambiar la contrasena del usuario de base de datos.
+3. Mover las credenciales reales a variables de entorno del sistema o a un gestor de secretos (nunca en archivo de texto en el repositorio).
+4. Instalar `gitleaks` o `detect-secrets` como hook de pre-commit para prevenir futuros accidentes.
+
+**SEC-20 — Contrasena del worker en CLI**
+
+Cambiar el worker para leer la contrasena desde `WORKER_PASSWORD` (variable de entorno) en lugar de `--password`. Actualizar `run_workers.sh` para no incluir valores por defecto de contrasena.
+
+**SEC-21 — Rate limiting en `/work/claim`**
+
+Aplicar `slowapi` en el endpoint `/work/claim` con limite por `provider_id`. Sin esto, un proveedor puede monopolizar todos los chunks disponibles.
+
+**SEC-22 — Timeout de chunks asignados**
+
+Implementar un job de mantenimiento (cron o Supabase scheduled function) que resetee a `pending` los chunks en estado `assigned` desde hace mas de 10 minutos. Sin esto, los crashes de workers dejan jobs bloqueados permanentemente.
+
+**SEC-23 — Sybil attack en consenso**
+
+Para el MVP: anadir un limite maximo de chunks asignados simultaneamente por `provider_id` en el mismo `job_id`. Esto no elimina el ataque pero lo hace ineficiente. Documentar el riesgo residual.
+
+**SEC-24 — Race condition en `credit_reward`**
+
+Aplicar la misma correccion de SEC-01 (UPDATE atomico) a `update_wallet_on_task_complete`. El flujo de pago de chunks es el camino critico del sistema.
+
+### Acciones de prioridad media (MEDIO — primera semana tras deploy)
+
+**SEC-25 — Sanitizacion de encabezados CSV**
+
+Anadir regex de sanitizacion en `split_csv` antes de que los encabezados lleguen al payload del chunk. Trabajo estimado: 2-3 horas.
+
+**SEC-26 — Limite de jobs activos por usuario**
+
+Anadir un maximo de jobs activos por cliente (5-10) y validacion del tamano del body JSON inline. Trabajo estimado: 4 horas.
+
+**SEC-28 — Validacion de `operation`**
+
+Anadir lista blanca de operaciones permitidas en el servidor y en el plugin del worker. Trabajo estimado: 1 hora.
+
+### Riesgos aceptados como deuda de MVP (documentados, no requieren accion inmediata)
+
+- **SEC-27** (datos del cliente visibles al proveedor): es el modelo de negocio de la plataforma. Documentar en terminos de servicio.
+- **SEC-29** (worker sin sandbox): el plugin actual no tiene RCE. Requiere accion antes de anadir plugins con subprocess.
+- **SEC-32** (RLS sin efecto real): idem SEC-05, deuda tecnica del modelo de autenticacion del MVP.

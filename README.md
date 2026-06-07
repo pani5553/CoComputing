@@ -354,6 +354,97 @@ Las migraciones **no se aplican automaticamente** en Docker. Se aplican directam
 
 ---
 
+## Computo Real Distribuido (feature v2)
+
+### Que es
+
+La feature v2 anade cómputo real y verificable sobre la infraestructura existente. Un usuario sube un CSV y elige una operación (media, suma, min, max, conteo); el sistema trocea el dataset en fragmentos (chunks), varios workers Python los procesan en paralelo en sus máquinas usando polars, y los resultados se validan por consenso antes de consolidarse y pagar a los proveedores en CC. El progreso que ve el cliente es real (chunks completados / total), no simulado.
+
+### Tablas nuevas — migración 004
+
+Ejecutar `migrations/004_compute.sql` en el SQL Editor de Supabase, despues de las tres migraciones anteriores.
+
+| Tabla | Proposito |
+|-------|-----------|
+| `jobs` | Trabajo de alto nivel enviado por el cliente. Campos clave: `status` (pending, splitting, processing, validating, completed, failed), `total_chunks`, `completed_chunks`, `reward_total`, `result` (jsonb consolidado). |
+| `chunks` | Fragmento de un job. Contiene el `payload` con las filas del CSV a procesar, el `status` (pending, assigned, done, rejected) y `replicas_needed` (por defecto 2 para consenso). |
+| `chunk_results` | Resultado individual que un proveedor entrega para un chunk. El campo `is_valid` (null = pendiente, true = valido, false = rechazado) lo asigna el servicio de consenso. |
+
+### Endpoints nuevos
+
+Todos requieren autenticacion JWT (`Authorization: Bearer <token>`).
+
+**Lado cliente:**
+
+| Metodo | Ruta | Descripcion |
+|--------|------|-------------|
+| `POST` | `/jobs` | Crea un job. Acepta multipart/form-data (campo `file` CSV + campo `params` JSON) o JSON puro con datos embebidos. Max 10 MB. |
+| `GET` | `/jobs` | Lista los jobs del cliente autenticado, ordenados por fecha descendente. |
+| `GET` | `/jobs/{job_id}` | Detalle con progreso real: `progress = completed_chunks / total_chunks * 100`. |
+| `GET` | `/jobs/{job_id}/result` | Resultado consolidado. Solo disponible cuando `status = completed`. Devuelve 409 si el job no ha terminado. |
+
+**Lado worker:**
+
+| Metodo | Ruta | Descripcion |
+|--------|------|-------------|
+| `POST` | `/work/claim` | El worker reclama hasta N chunks pendientes. Asignacion atomica con `FOR UPDATE SKIP LOCKED` via psycopg2. Body: `{"max_chunks": 1}`. |
+| `POST` | `/work/{chunk_id}/submit` | El worker entrega su resultado. Body: `{"result": {...}, "duration_ms": 1250}`. Dispara la logica de consenso. |
+
+### Aplicar la migracion 004
+
+En el SQL Editor de Supabase, ejecutar en este orden:
+
+1. `migrations/001_schema.sql`
+2. `migrations/002_rls.sql`
+3. `migrations/003_seed.sql` (solo en desarrollo/demo, nunca en produccion)
+4. `migrations/004_compute.sql`
+
+El fichero `004_compute.sql` es idempotente (`CREATE TABLE IF NOT EXISTS`, `DROP POLICY IF EXISTS`).
+
+### Lanzar un worker
+
+El worker se autentica con las credenciales de un proveedor existente y entra en un bucle de claim-process-submit:
+
+```bash
+cd backend
+python -m app.worker --api http://localhost:8000 --email tu@email.com --password tupassword
+```
+
+Parametros obligatorios:
+
+| Parametro | Descripcion |
+|-----------|-------------|
+| `--api` | URL base del backend (sin trailing slash) |
+| `--email` | Email del proveedor registrado en la plataforma |
+| `--password` | Contrasena del proveedor |
+
+El worker hace polling a `POST /work/claim` cada 5 segundos si no hay chunks disponibles. Se detiene con `Ctrl+C`.
+
+### Lanzar multiples workers (demo de distribucion)
+
+```bash
+bash scripts/run_workers.sh
+```
+
+El script levanta varias instancias del worker en paralelo. Editar el script para configurar el numero de instancias y las credenciales de cada proveedor.
+
+### Rutas nuevas del frontend
+
+| Ruta | Descripcion |
+|------|-------------|
+| `/jobs` | Lista de todos los jobs del cliente con estado real y barra de progreso basada en chunks. |
+| `/jobs/new` | Formulario para subir un CSV, elegir operacion y columnas, y enviar el job. |
+| `/jobs/:id` | Detalle del job con progreso en tiempo real (polling cada 5 segundos mientras no este en estado terminal). |
+| `/jobs/:id/result` | Resultado consolidado descargable como JSON. |
+
+### Nota de seguridad
+
+**El worker ejecuta computo sin sandboxing.** El proceso Python descarga payloads de la API y los procesa directamente con polars en la maquina del worker. En el MVP, el payload solo contiene datos tabulares (no codigo ejecutable) y la comunicacion es HTTPS con JWT. Sin embargo, si la API o la base de datos fuesen comprometidas, un payload malicioso podria afectar a la maquina del worker.
+
+**Usar el worker unicamente en entornos de confianza para el MVP.** El sandboxing real (contenedor aislado con seccomp/AppArmor, verificacion HMAC del payload, ejecucion sin acceso a red) queda fuera del alcance de esta version y debe implementarse antes de usar el worker en produccion con datos de terceros no confiables.
+
+---
+
 ## Licencia
 
 MIT

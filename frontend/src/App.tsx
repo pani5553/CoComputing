@@ -13,6 +13,10 @@ import ProcessingPage from './pages/ProcessingPage'
 import WalletPage from './pages/WalletPage'
 import ProfilePage from './pages/ProfilePage'
 import NotFoundPage from './pages/NotFoundPage'
+import JobListPage from './pages/JobListPage'
+import NewJobPage from './pages/NewJobPage'
+import JobDetailPage from './pages/JobDetailPage'
+import JobResultPage from './pages/JobResultPage'
 
 function SessionExpiredHandler() {
   const navigate = useNavigate()
@@ -46,6 +50,10 @@ export default function App() {
             <Route path="/procesando/:assignmentId" element={<ProcessingPage />} />
             <Route path="/cartera" element={<WalletPage />} />
             <Route path="/perfil" element={<ProfilePage />} />
+            <Route path="/jobs" element={<JobListPage />} />
+            <Route path="/jobs/new" element={<NewJobPage />} />
+            <Route path="/jobs/:id" element={<JobDetailPage />} />
+            <Route path="/jobs/:id/result" element={<JobResultPage />} />
           </Route>
         </Route>
 

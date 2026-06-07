@@ -935,3 +935,412 @@ Las siguientes historias han sido identificadas durante el análisis pero quedan
 | US-F08 | Panel de administración back-office | No necesario para validación. Se gestiona directamente en Supabase. |
 | US-F09 | Internacionalización multiidioma | La plataforma se lanza en español. Expansión futura condicionada al éxito del MVP. |
 | US-F10 | Aplicación móvil nativa (iOS / Android) | Segunda fase condicionada al éxito del MVP web. |
+
+---
+
+## Feature: Cómputo Real Distribuido
+
+**Versión:** 1.1
+**Fecha:** 2026-06-07
+**Referencia:** `briefs/02-computo-real.md`, `migrations/004_compute.sql`
+
+Esta sección extiende el backlog con las user stories de la feature de cómputo distribuido real. El sistema de autenticación (JWT via `/auth/login`), la cartera (`wallet_service`), el `trust_score`, los componentes UI (Card, Button, ProgressBar) y los stores Zustand ya existen y se reutilizan. Las tablas nuevas (`jobs`, `chunks`, `chunk_results`) están definidas en `migrations/004_compute.sql`.
+
+---
+
+### Épicas nuevas
+
+| ID | Épica | Descripción |
+|----|-------|-------------|
+| E-10 | Cómputo Distribuido - Cliente | Flujo completo del cliente para enviar un job de datos, seguir su progreso real y obtener el resultado consolidado |
+| E-11 | Cómputo Distribuido - Worker/Proveedor | Worker CLI que reclama y procesa chunks reales; pantalla del proveedor con progreso basado en chunks; consenso y pago automático |
+
+---
+
+### E-10: Cómputo Distribuido - Cliente
+
+---
+
+#### US-31 — Crear un nuevo job de procesamiento de datos
+
+**Prioridad:** Must Have
+**Estimación:** XL (8 puntos)
+**Épica:** E-10
+
+**Historia:**
+Como usuario autenticado que actúa como cliente,
+quiero subir un archivo CSV y elegir una operación (media, suma, min, max, conteo) sobre una o varias columnas,
+para enviar un trabajo de cómputo real al sistema distribuido y recibir el resultado procesado.
+
+**Criterios de aceptación:**
+
+1. **Acceso al formulario:** Existe una pantalla "Nuevo trabajo" accesible desde la navegación principal. Reutiliza los componentes Button y Card existentes.
+
+2. **Subida de CSV:** El formulario acepta un archivo `.csv` de hasta 50 MB. Si el archivo supera ese tamaño, se muestra el mensaje "El archivo no puede superar 50 MB" y no se envía.
+
+3. **Formato válido:** Si el archivo subido no es un CSV válido (no tiene cabecera, está vacío o contiene filas malformadas), el backend devuelve 422 con descripción del problema y la UI lo muestra al usuario.
+
+4. **Selección de operación:** El formulario permite elegir la operación: `mean`, `sum`, `min`, `max`, `count`. La selección es obligatoria; sin ella el botón "Enviar" permanece deshabilitado.
+
+5. **Selección de columnas:** Tras cargar el CSV en el frontend, se muestran las columnas detectadas para que el usuario seleccione sobre cuáles aplicar la operación. Al menos una columna debe estar seleccionada.
+
+6. **Envío exitoso:** Al confirmar, el sistema llama a `POST /jobs` (multipart/form-data o JSON con datos del CSV) con `job_type: "data-processing"` y los `params` correspondientes. Si el backend devuelve 201, la UI navega automáticamente a la pantalla "Mis trabajos" y muestra un mensaje de confirmación "Trabajo enviado correctamente".
+
+7. **Troceado en background:** El backend divide el dataset por filas en N chunks (mínimo 2, máximo configurable) y persiste los registros en la tabla `chunks`. El job pasa de `pending` a `splitting` y luego a `processing` de forma automática sin intervención del usuario.
+
+8. **Recompensa informativa:** El formulario muestra una estimación de la recompensa total del job (en CC) calculada por el backend según el tamaño del dataset, antes de confirmar el envío.
+
+9. **Estado de carga:** Mientras se procesa el envío, el botón muestra estado de carga y no permite doble envío.
+
+10. **Sin autenticación:** Un usuario no autenticado que acceda a la pantalla es redirigido al login.
+
+---
+
+#### US-32 — Listado de mis trabajos (cliente)
+
+**Prioridad:** Must Have
+**Estimación:** M (3 puntos)
+**Épica:** E-10
+
+**Historia:**
+Como cliente autenticado,
+quiero ver una lista de todos mis trabajos enviados con su estado actual y progreso,
+para saber en qué punto se encuentra cada uno sin tener que preguntar al sistema manualmente.
+
+**Criterios de aceptación:**
+
+1. **Listado propio:** La pantalla "Mis trabajos" llama a `GET /jobs` y muestra únicamente los jobs del cliente autenticado. Un cliente nunca ve los jobs de otro cliente.
+
+2. **Información por fila:** Cada job en la lista muestra: identificador corto (primeros 8 caracteres del UUID), fecha de creación, operación y columnas solicitadas (extraídas de `params`), estado actual con badge de color (pending=gris, processing=azul, validating=amarillo, completed=verde, failed=rojo) y progreso en porcentaje (`completed_chunks / total_chunks * 100`, redondeado a entero).
+
+3. **Barra de progreso real:** Se reutiliza el componente ProgressBar existente. El porcentaje refleja chunks validados sobre total, no tiempo transcurrido.
+
+4. **Lista vacía:** Si el cliente no tiene ningún job, se muestra "Aún no has enviado ningún trabajo. Pulsa 'Nuevo trabajo' para empezar." con enlace al formulario.
+
+5. **Actualización periódica:** La lista se refresca automáticamente cada 5 segundos mientras haya algún job en estado diferente de `completed` o `failed`. Si todos los jobs están en estado terminal, el polling se detiene.
+
+6. **Acceso al detalle:** Al pulsar sobre un job se navega a la pantalla de detalle de ese job (US-33).
+
+7. **Estado de carga y error:** Se muestra indicador de carga en la primera carga. Si la petición falla, se muestra error con opción de reintentar.
+
+---
+
+#### US-33 — Detalle y progreso real de un job
+
+**Prioridad:** Must Have
+**Estimación:** L (5 puntos)
+**Épica:** E-10
+
+**Historia:**
+Como cliente autenticado,
+quiero ver el estado detallado de un job concreto con el progreso real basado en chunks completados,
+para tener visibilidad del trabajo distribuido y saber cuándo estará listo el resultado.
+
+**Criterios de aceptación:**
+
+1. **Datos del job:** La pantalla llama a `GET /jobs/{id}` y muestra: estado, porcentaje de progreso (`completed_chunks / total_chunks * 100`), número de chunks total y completados, fecha de creación, operación y columnas.
+
+2. **Progreso real, no simulado:** El porcentaje mostrado se calcula exclusivamente a partir de `completed_chunks` y `total_chunks` devueltos por el backend. No existe lógica de simulación por tiempo transcurrido en esta pantalla.
+
+3. **Polling activo:** Si el job no está en estado terminal (`completed` o `failed`), la pantalla consulta `GET /jobs/{id}` cada 5 segundos y actualiza los datos sin recargar la página. Al alcanzar el estado terminal, el polling se detiene.
+
+4. **Transición a completado:** Cuando el job pasa a `completed`, la pantalla muestra automáticamente un banner "Trabajo completado" con un botón "Ver resultado" que lleva a la pantalla de resultado (US-34), sin que el usuario tenga que recargar manualmente.
+
+5. **Job fallido:** Si el job pasa a `failed`, la pantalla muestra un mensaje "El trabajo ha fallado. Puedes intentarlo de nuevo." con botón que lleva al formulario de nuevo job precargado con los mismos parámetros.
+
+6. **Acceso no autorizado:** Si el job no pertenece al cliente autenticado, el backend devuelve 403 y la UI muestra "No tienes acceso a este trabajo."
+
+7. **Job no encontrado:** Si el ID no existe, el backend devuelve 404 y la UI muestra "Trabajo no encontrado" con enlace a "Mis trabajos".
+
+8. **Limpieza del polling:** Al salir de la pantalla, el intervalo de polling se cancela.
+
+---
+
+#### US-34 — Ver el resultado final de un job completado
+
+**Prioridad:** Must Have
+**Estimación:** M (3 puntos)
+**Épica:** E-10
+
+**Historia:**
+Como cliente autenticado cuyo job ha sido completado,
+quiero ver el resultado consolidado del procesamiento de mis datos,
+para obtener el valor por el que envié el trabajo y poder usarlo.
+
+**Criterios de aceptación:**
+
+1. **Endpoint correcto:** La pantalla llama a `GET /jobs/{id}/result`. Si el job no está en estado `completed`, el backend devuelve 409 y la UI muestra "El resultado aún no está disponible."
+
+2. **Resultado visible:** El resultado se presenta en formato tabular o JSON legible: columna, operación aplicada, valor calculado (ej. `{"col1": {"mean": 42.3}, "col2": {"mean": 17.1}}`).
+
+3. **Descarga:** Existe un botón "Descargar resultado (JSON)" que descarga el campo `result` del job como archivo `.json` con nombre `resultado_{job_id_corto}.json`.
+
+4. **Metadatos del job:** La pantalla muestra también: fecha de completado, número de chunks procesados, número de proveedores que participaron y recompensa total pagada.
+
+5. **Acceso restringido:** Solo el cliente propietario del job puede ver el resultado. Cualquier otro usuario autenticado recibe 403.
+
+6. **Estado de carga:** Se muestra indicador mientras se obtienen los datos del resultado.
+
+---
+
+### E-11: Cómputo Distribuido - Worker/Proveedor
+
+---
+
+#### US-35 — Worker CLI: autenticación y bucle de claim/process/submit
+
+**Prioridad:** Must Have
+**Estimación:** XL (8 puntos)
+**Épica:** E-11
+
+**Historia:**
+Como proveedor que quiere contribuir recursos de cómputo,
+quiero ejecutar el worker CLI para que mi máquina procese chunks reales de forma autónoma,
+para ganar recompensas en CC sin intervención manual en cada tarea.
+
+**Criterios de aceptación:**
+
+1. **Arranque por CLI:** El worker se lanza con `python -m app.worker --api <url> --email <email> --password <password>`. Los tres argumentos son obligatorios; sin alguno el proceso termina con mensaje de error claro.
+
+2. **Autenticación reutilizada:** El worker usa exactamente el endpoint `POST /auth/login` existente para obtener el JWT. No implementa autenticación propia. Si las credenciales son incorrectas, el proceso termina con mensaje "Credenciales incorrectas. Verifica email y contraseña."
+
+3. **Claim atómico:** El worker llama a `POST /work/claim` para reclamar hasta N chunks `pending` (N configurable, por defecto 1). El backend asigna los chunks de forma atómica: si dos workers llaman simultáneamente, cada uno recibe chunks distintos sin colisiones.
+
+4. **Procesamiento real con polars:** Para `job_type: "data-processing"`, el worker ejecuta la operación indicada en `params` sobre las filas del chunk usando polars (o pandas como fallback). El resultado es el valor numérico calculado de verdad, no un valor aleatorio ni simulado.
+
+5. **Arquitectura de plugin:** La lógica de procesamiento está encapsulada en una clase `WorkerTask` con interfaz `process(payload: dict) -> dict`. El worker principal no contiene lógica de negocio del cómputo; solo orquesta claim, dispatch al plugin y submit.
+
+6. **Submit del resultado:** Tras procesar, el worker llama a `POST /work/{chunk_id}/submit` con el resultado y `duration_ms`. Si el backend devuelve 200, el worker registra en log "Chunk {chunk_id} enviado correctamente". Si devuelve error, lo registra y continúa con el siguiente chunk.
+
+7. **Polling continuo:** Si no hay chunks disponibles (`POST /work/claim` devuelve lista vacía), el worker espera 5 segundos y reintenta. El bucle continúa hasta que se interrumpe con Ctrl+C.
+
+8. **Log estructurado:** Cada operación relevante (login, claim, inicio de cómputo, submit, error) se registra en stdout con timestamp ISO 8601 y nivel (INFO, WARNING, ERROR). No se registran datos sensibles (passwords, contenido de chunks en crudo).
+
+9. **Script multi-worker:** Existe un script `scripts/run_workers.sh` (o `.ps1`) que lanza N instancias del worker en paralelo para demostrar la distribución. N es configurable como argumento.
+
+10. **Tests del worker:** Existe al menos un test de integración que crea un job con 2 chunks, lanza 2 instancias del worker, verifica que ambos chunks quedan en estado `done` y que el job pasa a `validating` o `completed`.
+
+---
+
+#### US-36 — Backend: endpoints de claim y submit para workers
+
+**Prioridad:** Must Have
+**Estimación:** XL (8 puntos)
+**Épica:** E-11
+
+**Historia:**
+Como worker Python autenticado,
+quiero poder reclamar chunks pendientes y entregar mis resultados a través de la API,
+para que el backend registre mi trabajo y pueda validarlo por consenso.
+
+**Criterios de aceptación:**
+
+1. **POST /work/claim — claim atómico:** El endpoint selecciona hasta N chunks en estado `pending` de entre todos los jobs en estado `processing`, los marca como `assigned`, registra `assigned_to = provider_id` del JWT, incrementa `attempts` y los devuelve en la respuesta. La operación es atómica (usa SELECT ... FOR UPDATE SKIP LOCKED o equivalente). Dos llamadas concurrentes nunca devuelven el mismo chunk.
+
+2. **Respeto a replicas_needed:** Un mismo chunk puede ser reclamado por hasta `replicas_needed` proveedores distintos. Si un chunk ya tiene `replicas_needed` resultados en `chunk_results`, no se incluye en futuros claims aunque su estado sea `assigned`.
+
+3. **POST /work/{chunk_id}/submit — entrega de resultado:** El endpoint acepta `result` (jsonb) y `duration_ms` (entero positivo). Crea un registro en `chunk_results`. Si `duration_ms <= 0`, devuelve 422. Si el proveedor ya entregó resultado para ese chunk, devuelve 409.
+
+4. **Activación de consenso tras submit:** Cada vez que se recibe un submit, el backend comprueba cuántos resultados existen ya para ese chunk. Si hay `replicas_needed` resultados, dispara la lógica de validación por consenso (US-38) de forma síncrona o asíncrona antes de responder.
+
+5. **Solo proveedores autenticados:** Ambos endpoints requieren JWT válido y devuelven 401 sin él. El proveedor solo puede hacer submit del chunk que tiene asignado; en caso contrario, 403.
+
+6. **Sin chunks disponibles:** Si `POST /work/claim` no encuentra chunks `pending` elegibles, devuelve 200 con lista vacía (no 404).
+
+7. **Tests:** Tests unitarios e integración que verifían: claim concurrente sin colisiones, submit correcto, submit duplicado (409), submit con duration_ms = 0 (422), claim sin chunks disponibles.
+
+---
+
+#### US-37 — Pantalla del proveedor: progreso basado en chunks reales
+
+**Prioridad:** Must Have
+**Estimación:** L (5 puntos)
+**Épica:** E-11
+
+**Historia:**
+Como proveedor autenticado que está procesando una tarea (en el sentido del sistema existente) o que contribuye como worker,
+quiero que la pantalla de procesamiento muestre el avance real basado en chunks completados y no en tiempo transcurrido simulado,
+para tener feedback auténtico de mi contribución al cómputo distribuido.
+
+**Criterios de aceptación:**
+
+1. **Integración con pantalla existente:** La pantalla de procesamiento existente (`/processing/{assignmentId}`) se amplía o coexiste con una nueva vista de chunks. No se elimina ni se rompe el flujo de asignaciones existente (US-13 sigue funcionando tal como está).
+
+2. **Indicador de chunks:** Si la asignación en curso corresponde a un job del pipeline distribuido, la pantalla muestra adicionalmente: número de chunks reclamados por el proveedor, cuántos han sido enviados, y cuántos han sido validados como correctos.
+
+3. **Sin progreso simulado para jobs reales:** Para jobs del tipo `data-processing`, el porcentaje de progreso mostrado en la ProgressBar se calcula como `chunks_submitted / chunks_claimed * 100`. No se usa la fórmula de tiempo transcurrido de `progress_service.py` para estos jobs.
+
+4. **Compatibilidad backward:** Las asignaciones de tipo tarea clásica (que no están vinculadas a un job distribuido) siguen mostrando el progreso simulado exactamente igual que antes. Ningún test de US-13 falla.
+
+5. **Actualización reactiva:** El indicador de chunks se actualiza cada vez que el worker CLI hace un submit exitoso (reflejado en el próximo ciclo de polling de la pantalla, que ya existe en 3 segundos).
+
+6. **Estado de validación visible:** Cuando un chunk del proveedor pasa a `is_valid = true` o `is_valid = false` tras el consenso, la pantalla lo refleja con una indicación visual (ej. checkmark verde o cruz roja junto al chunk).
+
+---
+
+#### US-38 — Validación por consenso y cierre del job
+
+**Prioridad:** Must Have
+**Estimación:** XL (8 puntos)
+**Épica:** E-11
+
+**Historia:**
+Como sistema de cómputo distribuido,
+quiero validar automáticamente los resultados de cada chunk comparando los resultados de múltiples proveedores,
+para garantizar que solo se consolidan resultados correctos y se pagan únicamente los proveedores que computaron de forma honesta.
+
+**Criterios de aceptación:**
+
+1. **Activación del consenso:** Cuando un chunk tiene exactamente `replicas_needed` resultados en `chunk_results`, el servicio de consenso se ejecuta automáticamente para ese chunk.
+
+2. **Consenso por coincidencia exacta:** Si los `replicas_needed` resultados son idénticos (comparación de los valores numéricos con tolerancia de ±0.0001 para floats), todos los `chunk_results` se marcan `is_valid = true` y el chunk pasa a estado `done`.
+
+3. **Desempate por 3er proveedor:** Si los resultados no coinciden, el chunk se reasigna a un tercer proveedor distinto (no puede ser ninguno de los dos anteriores). El sistema elige al proveedor con mayor `trust_score` disponible en ese momento. La lógica de claim estándar (US-36) incluye este caso sin crear un endpoint separado.
+
+4. **Resolución por mayoría (3 resultados):** Con 3 resultados, el valor que aparece en mayoría (al menos 2 de 3) se considera correcto. Los `chunk_results` coincidentes con la mayoría se marcan `is_valid = true`; el discrepante se marca `is_valid = false`.
+
+5. **Avance del job:** Cada vez que un chunk pasa a `done`, el campo `completed_chunks` del job se incrementa en 1 de forma atómica. Cuando `completed_chunks == total_chunks`, el job pasa a estado `completed` y se ejecuta la consolidación del resultado final.
+
+6. **Consolidación del resultado final:** El servicio de consolidación reduce los resultados parciales válidos de todos los chunks (operación de reduce apropiada para la operación solicitada: suma de sumas, media ponderada por número de filas, min global, max global, conteo total) y persiste el resultado en `jobs.result`.
+
+7. **Job marcado como completed:** El campo `jobs.completed_at` se registra con el timestamp de finalización. El estado pasa a `completed`.
+
+8. **Fallo por reintentos excesivos:** Si un chunk supera 5 intentos sin alcanzar consenso, su estado pasa a `rejected` y el job entero pasa a `failed`, con `completed_at` registrado.
+
+9. **Tests de consenso:** Existen tests que verifican los tres escenarios: (a) dos resultados iguales → ambos válidos, chunk done; (b) dos resultados distintos → se asigna un tercero; (c) tres resultados con mayoría de 2 → el discordante queda inválido.
+
+---
+
+#### US-39 — Pago a proveedores válidos y actualización de trust score tras consenso
+
+**Prioridad:** Must Have
+**Estimación:** L (5 puntos)
+**Épica:** E-11
+
+**Historia:**
+Como proveedor que ha procesado chunks de forma correcta,
+quiero recibir automáticamente el pago en CC en mi cartera y ver mi trust score actualizado,
+para que mi contribución tenga recompensa económica y de reputación sin intervención manual.
+
+**Criterios de aceptación:**
+
+1. **Pago solo por resultados válidos:** Al completarse un job, el servicio de pago itera sobre todos los `chunk_results` con `is_valid = true`. Solo estos reciben pago. Los `chunk_results` con `is_valid = false` no reciben ningún abono.
+
+2. **Distribución proporcional:** La recompensa del job (`jobs.reward_total`) se distribuye entre los proveedores con resultados válidos en proporción al número de chunks válidos que cada uno procesó. Si un proveedor procesó 3 de 10 chunks válidos totales, recibe el 30% de `reward_total`.
+
+3. **Reutilización de wallet_service:** El pago se realiza llamando al `wallet_service` y `transactions` existentes. Se crea una transacción de tipo `pago_tarea` por cada proveedor pagado, con descripción "Pago por job {job_id_corto} — {n} chunks válidos". El saldo `balance_available` del proveedor se incrementa.
+
+4. **Trust score subida por resultado válido:** Por cada `chunk_result` marcado `is_valid = true`, el `trust_score` del proveedor se recalcula inmediatamente usando el `trust_service` existente. La componente `accuracy` sube 2 puntos (con techo en 100).
+
+5. **Trust score penalizado por resultado inválido:** Por cada `chunk_result` marcado `is_valid = false`, la componente `accuracy` del proveedor baja 5 puntos (con suelo en 0) y el `trust_score` se recalcula.
+
+6. **Transacciones visibles en cartera:** Las nuevas transacciones de pago aparecen en `GET /wallet/transactions` del proveedor inmediatamente después del cierre del job, sin necesidad de recargar la app manualmente (el polling de la cartera, si existe, las recoge; si no, aparecen en la siguiente visita a la pantalla de cartera).
+
+7. **Idempotencia del pago:** Si el servicio de cierre se ejecuta dos veces por cualquier motivo (reintentos, fallos de red), no se generan transacciones duplicadas. El sistema verifica que no existe ya una transacción `pago_tarea` para ese job y ese proveedor antes de crear una nueva.
+
+8. **Tests de pago:** Existen tests que verifican: (a) proveedor con 2 chunks válidos recibe el porcentaje correcto de la recompensa; (b) proveedor con 0 chunks válidos no recibe ningún pago ni transacción; (c) el trust score sube para resultados válidos y baja para inválidos; (d) la idempotencia del pago (doble ejecución no duplica transacciones).
+
+---
+
+#### US-40 — Tests de integración end-to-end del pipeline de cómputo
+
+**Prioridad:** Must Have
+**Estimación:** XL (8 puntos)
+**Épica:** E-11
+
+**Historia:**
+Como desarrollador responsable de la calidad del pipeline de cómputo distribuido,
+quiero tests de integración que ejerciten el flujo completo desde la creación del job hasta el pago,
+para garantizar que todos los componentes funcionan juntos de forma correcta y que los bugs del pasado (progreso simulado) no vuelven a introducirse.
+
+**Criterios de aceptación:**
+
+1. **Test flujo feliz completo:** El test crea un job con un CSV de prueba de 100 filas y operación `mean`, simula 2 workers que reclaman y procesan todos los chunks con resultados coincidentes, y verifica que: el job pasa a `completed`, `jobs.result` contiene el valor correcto de la media, los proveedores reciben pago y sus trust scores suben.
+
+2. **Test de consenso con discrepancia:** El test simula 2 workers con resultados distintos para el mismo chunk, verifica que el chunk no pasa a `done` y que se asigna a un 3er proveedor, y que la resolución por mayoría funciona correctamente.
+
+3. **Test de claim concurrente:** El test lanza 5 peticiones simultáneas a `POST /work/claim` para un job con 3 chunks y verifica que no hay solapamiento: la suma de chunks reclamados no supera 3 y cada chunk aparece asignado a un único proveedor.
+
+4. **Test de idempotencia de pago:** El test llama al servicio de cierre del job dos veces y verifica que el número de transacciones en `wallet.transactions` no se duplica.
+
+5. **Test de no-regresión del progreso simulado:** El test verifica que `GET /tasks/{assignmentId}/progress` (endpoint existente de US-14) sigue funcionando correctamente para asignaciones de tipo tarea clásica y devuelve el progreso basado en tiempo, sin verse afectado por el nuevo código del pipeline.
+
+6. **Tests del worker:** Los tests del worker son reales: instancian la clase del plugin `WorkerTask` con un payload de datos real y verifican que el resultado calculado es correcto (no un mock del cómputo).
+
+7. **Build del frontend:** El pipeline de CI verifica que `tsc --noEmit` pasa sin errores después de añadir los tipos TypeScript para las entidades `Job`, `Chunk` y `ChunkResult`.
+
+8. **No se rompen los tests existentes:** Todos los tests de US-23 a US-30 continúan pasando sin modificaciones.
+
+---
+
+#### US-41 — Migración de base de datos y schema para cómputo distribuido
+
+**Prioridad:** Must Have
+**Estimación:** M (3 puntos)
+**Épica:** E-11
+
+**Historia:**
+Como desarrollador que configura el entorno para la feature de cómputo,
+quiero ejecutar la migración `migrations/004_compute.sql` para crear las tablas y políticas RLS necesarias,
+para que el pipeline de cómputo distribuido tenga soporte de persistencia desde el primer arranque.
+
+**Criterios de aceptación:**
+
+1. **Migración idempotente:** El fichero `migrations/004_compute.sql` puede ejecutarse múltiples veces sin errores ni datos duplicados (usa `CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`, `DROP POLICY IF EXISTS`).
+
+2. **Tablas creadas correctamente:** Tras ejecutar la migración, existen las tablas `jobs`, `chunks` y `chunk_results` con todos los campos, tipos, constraints y claves foráneas definidos en el brief.
+
+3. **RLS activado:** Las tres tablas tienen RLS habilitado. El backend (que usa service_role key) puede leer y escribir en todas ellas. Un usuario sin service_role no puede acceder directamente desde el cliente.
+
+4. **Orden de ejecución documentado:** El encabezado del fichero SQL indica explícitamente que debe ejecutarse después de `001_schema.sql`, `002_rls.sql` y `003_seed.sql`.
+
+5. **README actualizado:** El README incluye `migrations/004_compute.sql` en la secuencia de configuración del entorno local, inmediatamente después de las migraciones existentes.
+
+6. **Sin impacto en tablas existentes:** La ejecución de la migración no modifica, elimina ni añade columnas a las tablas `providers`, `tasks`, `task_assignments`, `wallets` ni `transactions`.
+
+---
+
+## Resumen actualizado del Backlog
+
+### Distribución por prioridad
+
+| Prioridad | Cantidad de stories | Puntos totales |
+|-----------|--------------------|--------------:|
+| Must Have | 37 | 141 |
+| Should Have | 2 | 4 |
+| Could Have | 0 | 0 |
+| Won't Have (MVP) | — | — |
+| **Total** | **39** | **145** |
+
+### Stories por épica (completo)
+
+| Épica | Stories | Puntos |
+|-------|---------|-------:|
+| E-01: Autenticación | US-01, US-02, US-03 | 7 |
+| E-02: Dashboard | US-04 | 5 |
+| E-03: Exploración de Tareas | US-05, US-06, US-07, US-08 | 13 |
+| E-04: Ciclo de Vida de Tarea | US-09, US-10, US-11, US-12 | 14 |
+| E-05: Procesamiento | US-13, US-14 | 11 |
+| E-06: Cartera | US-15, US-16, US-17 | 10 |
+| E-07: Perfil | US-18, US-19, US-20 | 9 |
+| E-08: Trust Score | US-21, US-22 | 7 |
+| E-09: Infraestructura y Calidad | US-23 a US-30 | 24 |
+| E-10: Cómputo Distribuido - Cliente | US-31, US-32, US-33, US-34 | 19 |
+| E-11: Cómputo Distribuido - Worker/Proveedor | US-35, US-36, US-37, US-38, US-39, US-40, US-41 | 45 |
+| **Total** | **US-01 a US-41** | **164** |
+
+> Nota: el total de puntos de la tabla por épica (164) difiere del total por prioridad (145) porque US-07 y US-22 son Should Have (4 puntos) y están excluidos del Must Have. La fila "Total" de la tabla por épica suma todos los puntos independientemente de la prioridad.
+
+### Secuencia de entrega sugerida para la feature (sprints adicionales)
+
+**Sprint 6 — Fundación de cómputo:**
+US-41 (Migración 004) → US-36 (Endpoints claim/submit) → US-35 (Worker CLI base + plugin polars)
+
+**Sprint 7 — Flujo cliente:**
+US-31 (Crear job) → US-32 (Listado de jobs) → US-33 (Detalle y progreso real) → US-34 (Resultado final)
+
+**Sprint 8 — Consenso y pago:**
+US-38 (Validación por consenso) → US-39 (Pago y trust score) → US-37 (Pantalla proveedor con chunks reales)
+
+**Sprint 9 — Calidad y cierre:**
+US-40 (Tests E2E del pipeline) → validación de no-regresión → build TypeScript limpio
