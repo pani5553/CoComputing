@@ -178,7 +178,15 @@ export interface Wallet {
   updated_at: string
 }
 
-export type TransactionType = 'pago_tarea' | 'retiro' | 'bonus' | 'penalizacion'
+export type TransactionType =
+  | 'pago_tarea'
+  | 'retiro'
+  | 'bonus'
+  | 'penalizacion'
+  | 'deposito'
+  | 'escrow'
+  | 'reembolso'
+  | 'pago_recibido'
 
 export type TransactionStatus = 'completada' | 'pendiente' | 'cancelada'
 
@@ -276,6 +284,96 @@ export interface OnlineStatusResponse {
 export interface NameUpdateResponse {
   full_name: string
   updated_at: string
+}
+
+// ─── Lado cliente ─────────────────────────────────────────────────────────────
+
+export interface DepositRequest {
+  amount: number
+}
+
+export interface DepositResponse {
+  transaction_id: string
+  amount: number
+  new_available_balance: number
+  message: string
+}
+
+export interface CreateTaskRequest {
+  title: string
+  task_type: TaskType
+  description: string
+  reward: number
+  difficulty: Difficulty
+  hardware_required: HardwareRequired
+  total_slots: number
+  duration_min: number
+  duration_max: number
+  stages: string[]
+  requester_name: string
+}
+
+export interface CreateTaskResponse {
+  task_id: string
+  title: string
+  reward: number
+  total_slots: number
+  escrow_total: number
+  new_available_balance: number
+  message: string
+}
+
+export interface ClientTaskSummary {
+  id: string
+  title: string
+  task_type: TaskType
+  reward: number
+  total_slots: number
+  slots_left: number
+  slots_completed: number
+  status: TaskStatus
+  escrow_held: number
+  escrow_released: number
+  created_at: string
+}
+
+export interface ClientTaskListResponse {
+  count: number
+  tasks: ClientTaskSummary[]
+}
+
+export interface AssignmentInfo {
+  id: string
+  provider_id: string
+  provider_name: string
+  status: AssignmentStatus
+  reward_paid: number | null
+  accepted_at: string
+  completed_at: string | null
+}
+
+export interface ClientTaskDetail {
+  id: string
+  title: string
+  task_type: TaskType
+  description: string
+  reward: number
+  difficulty: Difficulty
+  hardware_required: HardwareRequired
+  total_slots: number
+  slots_left: number
+  status: TaskStatus
+  escrow_held: number
+  escrow_released: number
+  assignments: AssignmentInfo[]
+  created_at: string
+}
+
+export interface CancelTaskResponse {
+  task_id: string
+  refund_amount: number
+  new_available_balance: number
+  message: string
 }
 
 // ─── Utiles ───────────────────────────────────────────────────────────────────

@@ -11,6 +11,7 @@ import {
   ArrowRightOnRectangleIcon,
   UserCircleIcon,
   CpuChipIcon,
+  PlusCircleIcon,
 } from '@heroicons/react/24/outline'
 import { clsx } from 'clsx'
 import { useAuth } from '../../hooks/useAuth'
@@ -25,6 +26,7 @@ export default function Navbar() {
     { to: '/dashboard', label: 'Inicio', icon: HomeIcon },
     { to: '/tareas', label: 'Tareas', icon: BriefcaseIcon },
     { to: '/jobs', label: 'Mis trabajos', icon: CpuChipIcon },
+    { to: '/cliente/mis-tareas', label: 'Publicar', icon: PlusCircleIcon },
     { to: '/cartera', label: 'Cartera', icon: WalletIcon },
     { to: '/perfil', label: 'Perfil', icon: UserIcon },
   ]

@@ -9,7 +9,7 @@ from typing import Any
 
 from fastapi import HTTPException, status
 
-from app.db.queries import task_queries, wallet_queries
+from app.db.queries import client_queries, task_queries, wallet_queries
 from app.db.queries.profile_queries import get_provider_by_id, update_provider
 from app.services import trust_score as ts
 
@@ -140,10 +140,10 @@ def complete_task(provider_id: str, task_id: str) -> dict[str, Any]:
         },
     )
 
-    # Update wallet
+    # Update provider wallet (credit reward)
     wallet_queries.update_wallet_on_task_complete(provider_id, reward)
 
-    # Create transaction
+    # Create transaction for provider
     wallet_queries.create_transaction(
         provider_id=provider_id,
         amount=reward,
@@ -152,6 +152,10 @@ def complete_task(provider_id: str, task_id: str) -> dict[str, Any]:
         status="completada",
         task_id=task_id,
     )
+
+    # Release one escrow slot from the client (if task has a client/escrow)
+    if task.get("client_id"):
+        client_queries.release_escrow_slot(task_id, task["client_id"], reward)
 
     # Fetch current provider data
     provider = get_provider_by_id(provider_id)

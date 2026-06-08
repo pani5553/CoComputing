@@ -242,6 +242,22 @@ const txTypeConfig: Record<TransactionType, { label: string; classes: string }> 
     label: 'Penalización',
     classes: 'text-danger-400 bg-danger-400/10',
   },
+  deposito: {
+    label: 'Depósito',
+    classes: 'text-brand-400 bg-brand-400/10',
+  },
+  escrow: {
+    label: 'Escrow',
+    classes: 'text-amber-400 bg-amber-400/10',
+  },
+  reembolso: {
+    label: 'Reembolso',
+    classes: 'text-emerald-400 bg-emerald-400/10',
+  },
+  pago_recibido: {
+    label: 'Pago recibido',
+    classes: 'text-success-400 bg-success-400/10',
+  },
 }
 
 export function TransactionTypeBadge({ type }: { type: TransactionType }) {

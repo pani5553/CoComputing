@@ -17,6 +17,10 @@ import JobListPage from './pages/JobListPage'
 import NewJobPage from './pages/NewJobPage'
 import JobDetailPage from './pages/JobDetailPage'
 import JobResultPage from './pages/JobResultPage'
+import DepositPage from './pages/client/DepositPage'
+import PublishTaskPage from './pages/client/PublishTaskPage'
+import MyTasksPage from './pages/client/MyTasksPage'
+import ClientTaskDetailPage from './pages/client/ClientTaskDetailPage'
 
 function SessionExpiredHandler() {
   const navigate = useNavigate()
@@ -54,6 +58,10 @@ export default function App() {
             <Route path="/jobs/new" element={<NewJobPage />} />
             <Route path="/jobs/:id" element={<JobDetailPage />} />
             <Route path="/jobs/:id/result" element={<JobResultPage />} />
+            <Route path="/cliente/recargar" element={<DepositPage />} />
+            <Route path="/cliente/publicar" element={<PublishTaskPage />} />
+            <Route path="/cliente/mis-tareas" element={<MyTasksPage />} />
+            <Route path="/cliente/tareas/:taskId" element={<ClientTaskDetailPage />} />
           </Route>
         </Route>
 
