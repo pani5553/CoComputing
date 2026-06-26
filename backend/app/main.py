@@ -99,5 +99,6 @@ app.include_router(client.router, prefix="/client", tags=["client"])
 
 @app.get("/health", tags=["health"], include_in_schema=not settings.is_production)
 def health_check() -> dict:
-    """Simple health check endpoint."""
+    if settings.is_production:
+        return {"status": "ok"}
     return {"status": "ok", "environment": settings.environment}

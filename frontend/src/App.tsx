@@ -1,4 +1,4 @@
-import { Routes, Route, Navigate, useNavigate } from 'react-router-dom'
+import { Routes, Route, useNavigate } from 'react-router-dom'
 import { useEffect } from 'react'
 
 import ProtectedRoute from './components/layout/ProtectedRoute'
@@ -21,6 +21,7 @@ import DepositPage from './pages/client/DepositPage'
 import PublishTaskPage from './pages/client/PublishTaskPage'
 import MyTasksPage from './pages/client/MyTasksPage'
 import ClientTaskDetailPage from './pages/client/ClientTaskDetailPage'
+import LandingPage from './pages/LandingPage'
 
 function SessionExpiredHandler() {
   const navigate = useNavigate()
@@ -65,8 +66,8 @@ export default function App() {
           </Route>
         </Route>
 
-        {/* Redirecciones */}
-        <Route path="/" element={<Navigate to="/dashboard" replace />} />
+        {/* Landing pública */}
+        <Route path="/" element={<LandingPage />} />
         <Route path="*" element={<NotFoundPage />} />
       </Routes>
     </>

@@ -1414,3 +1414,46 @@ Anadir lista blanca de operaciones permitidas en el servidor y en el plugin del 
 - **SEC-27** (datos del cliente visibles al proveedor): es el modelo de negocio de la plataforma. Documentar en terminos de servicio.
 - **SEC-29** (worker sin sandbox): el plugin actual no tiene RCE. Requiere accion antes de anadir plugins con subprocess.
 - **SEC-32** (RLS sin efecto real): idem SEC-05, deuda tecnica del modelo de autenticacion del MVP.
+
+---
+
+## Checklist de Seguridad para Despliegue Público (Feature 04 — Landing + Deploy)
+
+**Fecha:** 2026-06-08
+
+### Secretos y configuración
+
+- [ ] Todos los secretos configurados **solo** en el panel del hosting (Vercel / Railway env vars), nunca en el repositorio
+- [ ] `SUPABASE_SERVICE_ROLE_KEY` presente **únicamente** en las variables de entorno del backend (Railway/Render). El frontend nunca debe tener acceso a esta clave
+- [ ] `JWT_SECRET_KEY` generado con `openssl rand -hex 32` y configurado en Railway. Mínimo 32 caracteres
+- [ ] `ENVIRONMENT=production` activo en el servidor de backend → desactiva `/docs`, `/redoc`, `/openapi.json`
+- [ ] `FRONTEND_URL` apunta exactamente al dominio de Vercel sin trailing slash (ej. `https://co-computing.vercel.app`). **Sin wildcard `*`**
+- [ ] `VITE_API_URL` en Vercel apunta a la URL pública del backend en Railway (ej. `https://co-computing-api.up.railway.app`)
+- [ ] `SUPABASE_DB_URL` incluye `?sslmode=require` al final de la cadena de conexión
+
+### Backend en producción
+
+- [ ] Verificar que `GET /health` devuelve únicamente `{"status":"ok"}` en producción (sin campo `environment`)
+- [ ] Verificar que `GET /docs`, `/redoc` y `/openapi.json` devuelven 404 en producción
+- [ ] Verificar que `Access-Control-Allow-Origin` en las respuestas coincide exactamente con el dominio del frontend (no `*`)
+- [ ] El servidor arranca con `--proxy-headers` si hay proxy reverso (Railway lo gestiona automáticamente)
+
+### Frontend en producción
+
+- [ ] `npm run build` completa sin errores antes del despliegue
+- [ ] `vercel.json` con `rewrites` está en la carpeta `frontend/` para que el SPA funcione correctamente
+- [ ] `VITE_API_URL` configurada como variable de entorno en Vercel (Settings → Environment Variables), no hardcodeada en el código
+- [ ] Los source maps de producción no son accesibles públicamente (configurar `sourcemap: false` en `vite.config.ts` si es necesario)
+
+### Base de datos
+
+- [ ] En producción ejecutar **únicamente**: `001_schema.sql`, `002_rls.sql`, `003_seed_tasks.sql` (o solo las tareas del seed, no la cuenta demo)
+- [ ] **NO** ejecutar `003_seed.sql` completo — contiene cuenta demo con credenciales públicas (`demo@co-computing.io` / `demo1234`)
+- [ ] Ejecutar `migrations/005_client.sql` si se activa el lado cliente
+
+### Landing page
+
+- [ ] La ruta `/` muestra la landing pública sin requerir autenticación
+- [ ] Los usuarios autenticados son redirigidos a `/dashboard` automáticamente al visitar `/`
+- [ ] Los enlaces "Registrarse" e "Iniciar sesión" de la landing apuntan a `/registro` y `/login` respectivamente
+- [ ] La landing es responsive en móvil (verificar en 375px de ancho)
