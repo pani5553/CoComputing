@@ -1457,3 +1457,195 @@ Anadir lista blanca de operaciones permitidas en el servidor y en el plugin del 
 - [ ] Los usuarios autenticados son redirigidos a `/dashboard` automáticamente al visitar `/`
 - [ ] Los enlaces "Registrarse" e "Iniciar sesión" de la landing apuntan a `/registro` y `/login` respectivamente
 - [ ] La landing es responsive en móvil (verificar en 375px de ancho)
+
+---
+
+## Auditoría — Publicación Vercel + Botón "Añadir créditos" — 2026-07-06
+
+**Auditor:** Security Agent
+**Referencia:** `briefs/05-vercel-creditos.md`; `docs/05-review.md`, sección "Revisión — Publicación Vercel + Botón 'Añadir créditos' — 2026-07-06" (Code Reviewer Senior)
+**Alcance de esta sección:** (A) el mismo WIP de backend sin commitear que QA y el Code Reviewer ya identificaron y verificaron como bloqueante por **fiabilidad** (migración de psycopg2 a Supabase REST: `backend/app/db/supabase_client.py` nuevo/sin trackear, `backend/app/core/config.py` y `backend/app/db/queries/task_queries.py` modificados) — auditado aquí **exclusivamente desde el ángulo de seguridad**; doy por leído y válido el análisis de fiabilidad del Reviewer (import roto, colapso de los 71 tests, R3-CRIT-01, R3-CRIT-02, R3-MAYOR-01, R3-MAYOR-02) y no lo repito. (B) Confirmación estándar de los entregables reales del brief 05: botón "Añadir créditos" (`WalletPage.tsx`), CORS, `/docs`/`/redoc` en producción.
+
+### Método de verificación
+
+No me limité a leer el reporte del Reviewer ni a asumir el peor escenario posible; verifiqué cada pregunta contra evidencia concreta:
+
+1. Inspeccioné el código fuente instalado de `supabase-py`, `postgrest` y `httpx` en este entorno (`Client.__init__`, `create_client`, `postgrest.exceptions.APIError`, `httpx._exceptions.RequestError`/`HTTPStatusError`) para responder con evidencia, no especulación, si el `service_role_key` puede llegar a interpolarse en un mensaje de excepción. **Nota de honestidad:** la versión resuelta localmente (`supabase==2.25.1`) difiere de la fijada en `backend/requirements.txt` (`supabase==2.10.0`); el comportamiento verificado abajo (orden de validación en `Client.__init__`, forma de `APIError`/`RequestError`) es estructural a la librería y estable entre versiones recientes, pero lo señalo por transparencia.
+2. Releí `backend/app/main.py` completo para confirmar el comportamiento del handler genérico de excepciones y su relación (o no) con `settings.is_production`.
+3. Repetí, de forma independiente y no solo citando al Reviewer, un `grep` de `supabase_db_url` sobre todo `backend/` para verificar el radio de impacto real de R3-CRIT-02 — encontré una ocurrencia adicional no listada en `docs/05-review.md` (ver hallazgo SEC-35).
+4. Releí `backend/app/routers/tasks.py` para confirmar que la comprobación de propiedad (`provider_id` del recurso == `provider_id` del JWT) sigue intacta tras la reescritura de `task_queries.py` — esto es exactamente lo que el handoff del Reviewer (punto 5) pedía verificar si el WIP llegase a fusionarse; lo verifiqué ya ahora, en frío, para dejar constancia.
+5. Confirmé con `git diff`, `git status --porcelain` y `git log --all --full-history -- backend/.env "**/.env"` el estado real del árbol de trabajo y del historial (sin alterarlo).
+6. Leí `WalletPage.tsx` línea a línea en las zonas del botón (247–253) y el modal (514–533), y ejecuté un grep de patrones de secreto (`api[_-]?key`, `secret`, `password`, `Bearer`, `service_role`) sobre el fichero completo: cero coincidencias.
+7. Grep de `os.environ`, `settings.dict()`/`model_dump()` y patrones de volcado de configuración sobre todo `backend/app/`: cero coincidencias — no hay ningún endpoint ni script nuevo que exponga variables de entorno o el objeto `settings` completo.
+
+### Índice de hallazgos de este ciclo
+
+| ID | Severidad | Resumen |
+|----|-----------|---------|
+| SEC-33 | MEDIO | `supabase_client.py`: cliente Supabase duplicado, construido de forma *eager* con `os.getenv` crudo y sin `SecretStr` — **no se confirma** fuga del `service_role_key` en el fallo ya reproducido por el Reviewer, pero el patrón amplía la superficie para una fuga futura por error humano |
+| SEC-34 | BAJO | `except Exception: print(f"...: {e}")` en `task_queries.py` (3 funciones) — **no filtra** el `service_role_key` ni el DSN de PostgreSQL (verificado contra las clases de excepción reales), pero es un canal de log no estructurado, sin control de nivel, inconsistente con el logger del proyecto |
+| SEC-35 | MEDIO | `supabase_db_url` opcional (R3-CRIT-02): **no se confirma** fuga de stack trace/connection string al cliente HTTP aunque `ENVIRONMENT` esté mal configurado (el handler genérico de excepciones no depende de `is_production`); pero el radio de impacto real alcanza también el camino de **pago a proveedores** (`wallet_queries.update_wallet_on_task_complete`), no solo escrow de cliente y cómputo |
+
+Ningún hallazgo de esta sección alcanza severidad CRÍTICO o ALTO desde el ángulo de seguridad puro — la severidad CRÍTICA de este WIP ya está correctamente capturada por el Reviewer desde el ángulo de fiabilidad (R3-CRIT-01, R3-CRIT-02) y sigue siendo bloqueante para fusionar o desplegar tal cual, por esa razón. Ver "Constancia explícita" al final de esta sección.
+
+---
+
+#### SEC-33 — Cliente Supabase duplicado con construcción *eager* y `os.getenv` crudo — sin fuga confirmada, pero superficie ampliada
+
+**CWE:** CWE-532 (Insertion of Sensitive Information into Log File) — de forma preventiva, no confirmada
+**Severidad:** MEDIO
+**Archivo:** `backend/app/db/supabase_client.py` (nuevo, sin trackear, 7 líneas)
+
+**Pregunta original:** ¿hay riesgo de que el `service_role_key` se registre en algún log si `create_client` falla?
+
+**Respuesta, con evidencia:** No, no en el escenario ya reproducido. Inspeccioné el código real de `supabase_client.Client.__init__` (el método que ejecuta `create_client`):
+
+```python
+if not supabase_url:
+    raise SupabaseException("supabase_url is required")
+if not supabase_key:
+    raise SupabaseException("supabase_key is required")
+if not re.match(r"^(https?)://.+", supabase_url):
+    raise SupabaseException("Invalid URL")
+```
+
+Los tres mensajes son cadenas **estáticas**: ninguna interpola `supabase_url` ni `supabase_key`. El valor de la clave solo se usa *después* de pasar estas comprobaciones (para construir las cabeceras `apikey`/`Authorization`), así que en el escenario exacto que reprodujo el Reviewer (`SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` ausentes → `None`), la excepción `SupabaseException: supabase_url is required` que se propaga hasta el traceback de import no contiene el valor de ninguna de las dos variables (no hay nada que filtrar: son `None`, y el mensaje ni las menciona). Además, esta excepción concreta ocurre en tiempo de *import* (`supabase = create_client(...)` es una sentencia a nivel de módulo) — antes de que exista el objeto `app` de FastAPI, por lo que ni siquiera llega al `@app.exception_handler(Exception)` de `main.py`; se manifiesta como traceback crudo de Python en stdout/stderr del proceso (terminal del desarrollador, logs del contenedor Docker/Railway, logs de CI), pero un traceback sin el valor de la clave no es una fuga de la clave.
+
+**Lo que sí es un hallazgo real (preventivo):** este fichero introduce un **segundo mecanismo** para obtener credenciales de Supabase, independiente y con una fuente de verdad distinta al ya existente `app/db/client.py` (que lee de `app.core.config.settings`, validado por `pydantic-settings`, con inicialización perezosa vía `@lru_cache`). Dos problemas de higiene de secretos, no de explotabilidad inmediata:
+
+1. **`os.getenv` crudo en vez de `settings`:** duplica la fuente de configuración y es exactamente el tipo de código que invita a un futuro desarrollador — depurando este mismo `SupabaseException` — a añadir un `print(SUPABASE_KEY)` o `print(f"URL={SUPABASE_URL} KEY={SUPABASE_KEY}")` ad hoc para diagnosticar por qué las variables llegan vacías. El patrón perezoso ya existente en `app/db/client.py` no elimina esta tentación, pero al menos concentra el acceso a la clave en un único punto auditable.
+2. **Ninguno de los dos campos relacionados (`supabase_service_role_key` en `config.py`, ni las constantes módulo-nivel de este fichero nuevo) usa `pydantic.SecretStr`.** Con un `str` normal, si en el futuro alguien hace `print(settings)`, registra el objeto `Settings` completo, o Pydantic genera un `ValidationError` que incluya `input_value=...` para este campo (hoy no ocurre porque el campo no tiene validador propio, pero es una protección de defensa en profundidad barata de añadir), el valor en texto plano del `service_role_key` — la credencial que **bypasea RLS por completo** (ver SEC-05/SEC-19 arriba) — podría aparecer sin enmascarar. `SecretStr` habría hecho que cualquier `print`/`repr` accidental mostrara `**********` en vez del valor real.
+
+**Impacto:** Bajo hoy (nada se filtra en el fallo actual, confirmado por lectura de código). Medio como deuda de higiene de secretos: reduce el margen de error humano alrededor de la credencial más privilegiada del sistema.
+
+**Mitigación concreta:**
+- Si se seguiel Opción A del Reviewer (revertir `supabase_client.py` a inexistente): este hallazgo queda cerrado automáticamente, no requiere acción adicional.
+- Si se sigue la Opción B (conservar la migración a REST): eliminar `supabase_client.py` y que `task_queries.py` línea 150 use `get_supabase()` igual que las otras nueve funciones del fichero (esto también resuelve R3-CRIT-01 y R3-MAYOR-02 de una sola vez, tal como ya recomendó el Reviewer).
+- Independientemente de A/B: envolver `supabase_service_role_key` y `jwt_secret_key` en `config.py` con `pydantic.SecretStr` en vez de `str`, y usar `.get_secret_value()` solo en el único punto donde se construye el cliente. Esto es una mejora de defensa en profundidad de bajo costo, no ligada a este WIP concreto.
+
+**Estado actual:** SIN FUGA CONFIRMADA en el fallo reproducido. Recomendación de hardening PENDIENTE.
+
+---
+
+#### SEC-34 — `print(f"...: {e}")` en `task_queries.py`: canal de log no estructurado, sin fuga de credenciales confirmada
+
+**CWE:** CWE-532 (Insertion of Sensitive Information into Log File), CWE-209 (Generation of Error Message Containing Sensitive Information) — evaluados y descartados para el secreto específico; el hallazgo residual es de higiene de logging
+**Severidad:** BAJO
+**Archivo:** `backend/app/db/queries/task_queries.py` — `decrement_slots_atomic` (líneas 95–97), `get_provider_assignments_history` (líneas 172–174), `get_assignment_with_task` (líneas 261–263)
+
+**Pregunta original:** ¿el manejo de errores genérico en estas tres funciones podría filtrar datos sensibles (connection strings, tokens) a stdout/logs?
+
+**Respuesta, con evidencia:** Verifiqué las dos clases de excepción realistas que estas funciones pueden capturar, ya que ambas viajan por HTTP a través de PostgREST (no usan psycopg2 — el propio docstring del fichero lo confirma: "Uses Supabase REST API exclusively"):
+
+- `postgrest.exceptions.APIError` (error de negocio/esquema devuelto por PostgREST): su `__repr__` solo compone `code`, `message`, `hint` y `details`, todos ellos tomados del cuerpo JSON de error que devuelve PostgREST. Nunca incluye las cabeceras de la petición (`apikey`, `Authorization: Bearer <service_role_key>`) ni la URL completa con query params.
+- `httpx.RequestError`/`HTTPStatusError` (error de red/transporte: timeout, DNS, conexión rechazada): el constructor (`RequestError.__init__(self, message, *, request=None)`) almacena un `message` de texto construido por `httpx`, no una copia de las cabeceras de la petición. `str(e)` no expone la cabecera `Authorization`.
+
+Por tanto, el `service_role_key` **no debería** aparecer en el texto de `e` para ninguna de las dos rutas de fallo realistas de estas tres funciones. Esto es coherente con la propia verificación del Reviewer: el `SupabaseException` de import-time tampoco lo expone (ver SEC-33).
+
+**Lo que sí sigue siendo un hallazgo real, aunque menor:** el uso de `print()` en vez de `logging.getLogger("co-computing")` (el logger que ya usa `main.py`) tiene tres efectos de seguridad/higiene, no de fuga de credenciales:
+
+1. Bypasea el control de nivel de log de producción (`main.py` fija `logging.WARNING` en producción); un `print()` siempre escribe a stdout sin importar el nivel configurado, lo que en un contenedor puede mezclarse de forma no estructurada con el resto de la salida y complicar la redacción/filtrado si en el futuro se añade un procesador de logs que enmascare campos sensibles a nivel del logger (un `print` nunca pasaría por ese procesador).
+2. Los campos `hint`/`details` de un `APIError` de PostgREST pueden, en general (no en estas tres funciones concretas hoy), incluir fragmentos de datos si el error proviene de una violación de constraint con valores literales (patrón clásico de Postgres: "Key (email)=(...) already exists"). Ninguna de las tres funciones auditadas aquí hace un INSERT/UPDATE con una constraint de unicidad que dispare ese sub-caso — `decrement_slots_atomic` hace un UPDATE condicional sin restricción de unicidad, y las otras dos son SELECT de solo lectura —, así que el riesgo concreto hoy es bajo, pero el patrón (capturar y volcar `str(e)` a un canal no controlado) es el mismo que sí sería explotable si se copia a una función futura que sí inserte/actualice con constraints.
+3. Es exactamente el patrón que, aplicado a estas tres funciones y a ninguna otra del fichero, ya señaló el Reviewer como R3-MAYOR-01 desde el ángulo de fiabilidad (oculta errores de infraestructura como resultados de negocio). Desde el ángulo de seguridad, el mismo cambio de código tiene un efecto secundario interesante y no del todo negativo: al capturar la excepción y devolver `False`/`[]`/`None` en vez de dejarla propagar, estas tres funciones **nunca** llegan a exponer nada al cliente HTTP (ni siquiera el 500 genérico) — para el cliente externo, el fallo de infraestructura es indistinguible de una respuesta de negocio normal. Eso reduce la superficie de exposición *hacia el cliente* a cambio de aumentarla *hacia los logs del contenedor* (que ya está dentro del perímetro de confianza operacional, no expuesto a Internet). Es un cambio de superficie, no una fuga nueva hacia un atacante externo.
+
+**Impacto:** Bajo. No hay fuga de credenciales confirmada. El riesgo residual es de higiene de logging y de un patrón replicable que podría volverse más serio si se copia a funciones con INSERT/UPDATE sensibles a constraints.
+
+**Mitigación concreta:** La misma que ya recomendó el Reviewer en R3-MAYOR-01 (usar `logger.exception(...)` y re-lanzar) resuelve también este hallazgo de seguridad: centraliza el log en el canal estructurado del proyecto, recupera el nivel/formato consistentes, y permite en el futuro añadir un filtro de logging que redacte patrones de secretos si se considera necesario (p.ej. un `logging.Filter` que aplique regex sobre mensajes antes de emitirlos).
+
+**Estado actual:** SIN FUGA DE CREDENCIALES CONFIRMADA. Hallazgo de higiene de logging PENDIENTE, de baja severidad, resoluble con el mismo fix que ya pide el Reviewer por fiabilidad.
+
+---
+
+#### SEC-35 — `supabase_db_url` opcional (R3-CRIT-02): sin fuga confirmada al cliente HTTP, pero radio de impacto más amplio de lo documentado
+
+**CWE:** CWE-703 (Improper Check for Exceptional Conditions) — mismo CWE ya usado para SEC-22, por consistencia; ángulo de disponibilidad más que de divulgación
+**Severidad:** MEDIO
+**Archivos:** `backend/app/core/config.py` línea 10; `backend/app/main.py` líneas 33–40 y 73–79; `backend/app/db/queries/wallet_queries.py` línea 105 (hallazgo adicional, ver abajo)
+
+**Pregunta original:** ¿un arranque "silencioso" sin `SUPABASE_DB_URL` podría dejar el sistema en un estado donde algunas rutas fallan revelando información (stack traces con la cadena de conexión) a un cliente externo si `ENVIRONMENT` no está bien puesto a `production`?
+
+**Respuesta, con evidencia:** No debería, y esto es independiente de si `ENVIRONMENT` está bien configurado o no — verifiqué que **el handler genérico de excepciones no depende de `settings.is_production`**:
+
+```python
+# main.py líneas 73–79 — registrado incondicionalmente, sin gate de is_production
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    logger.exception("Unhandled exception: %s", exc)
+    return JSONResponse(status_code=500, content={"detail": "Error interno del servidor"})
+```
+
+Y `app = FastAPI(...)` (líneas 33–40) no fija `debug=True` en ningún punto (el valor por defecto de FastAPI/Starlette es `debug=False`), lo cual importa porque si `debug=True` estuviera activo, Starlette mostraría su página HTML de traceback de depuración **en vez de** invocar este handler, sin importar el valor de `ENVIRONMENT`. Con la configuración actual, un `psycopg2.OperationalError` (el síntoma que describe el propio brief 05 y que confirma el Reviewer: "error de conexión a socket local") originado dentro de cualquier función de servicio, incluso una llamada desde un hilo del pool de FastAPI para una ruta síncrona, se propaga hasta este handler y el cliente HTTP solo ve `{"detail": "Error interno del servidor"}` con código 500 — nunca el mensaje real de `psycopg2` ni la cadena de conexión. Esto se cumple **incluso si `ENVIRONMENT` quedase mal configurado** (p. ej. olvidado en `development` en producción), porque el handler no consulta ese valor. Dicho de otro modo: la ausencia de fail-fast en el arranque (R3-CRIT-02) es un problema real, pero su materialización más probable no es una fuga de información al cliente — es un 500 genérico y repetido, indistinguible de cualquier otro error interno.
+
+**Lo que sí encontré, de forma independiente, y que amplía lo ya documentado:** repetí el `grep` de `settings.supabase_db_url` sobre todo `backend/` (no solo sobre los ficheros que cita el Reviewer) y confirmé 12 puntos de uso sin ningún guard de `None`:
+- `backend/app/db/queries/client_queries.py`: 7 ocurrencias (ya citadas por el Reviewer).
+- `backend/app/db/queries/compute_queries.py`: 4 ocurrencias (ya citadas por el Reviewer).
+- **`backend/app/db/queries/wallet_queries.py` línea 105, dentro de `update_wallet_on_task_complete`** — **no citada en la sección de este ciclo de `docs/05-review.md`**. Esta es precisamente la función que abona recompensas a proveedores al completar tareas (marcada C-03/R2-C-02 en revisiones anteriores por su propio problema de atomicidad) y que usa psycopg2 exactamente por el mismo motivo que escrow/cómputo: necesita un `UPDATE` aritmético atómico que el SDK REST de Supabase no puede expresar en una sola operación.
+
+**Impacto de este hallazgo adicional:** El radio de impacto real de R3-CRIT-02, si `SUPABASE_DB_URL` faltase en Railway, no se limita a "escrow del cliente y jobs de cómputo" (como dice el brief 05 y repite el Reviewer) — también rompe, request a request y de la misma forma confusa, el **pago de recompensas a proveedores por tareas completadas**, que es tan camino-de-dinero-real como el escrow. Esto no cambia la severidad ya asignada por el Reviewer (sigue siendo CRÍTICO por fiabilidad), pero sí es información nueva y relevante para quien decida el fix: cualquier plan de mitigación para R3-CRIT-02 debe considerar `wallet_queries.py` además de `client_queries.py` y `compute_queries.py`.
+
+**Mitigación concreta:** La misma que ya pide el Reviewer para R3-CRIT-02 (revertir a `str` obligatorio, o añadir un `@model_validator(mode="after")` que falle alto si es `None`) cubre automáticamente los 12 puntos de uso, incluido `wallet_queries.py`, porque el fallo se movería de vuelta al arranque del proceso. Adicionalmente, y esto sí es una recomendación puramente de seguridad/disponibilidad para DevOps: no depender únicamente del fail-fast de `pydantic-settings` como única red de seguridad — marcar `SUPABASE_DB_URL` como variable **requerida** en la configuración de Railway (si la plataforma lo permite) y/o añadir un healthcheck de arranque que abra una conexión psycopg2 real antes de aceptar tráfico, tal como ya pedía el punto 1 del handoff del Reviewer.
+
+**Estado actual:** SIN FUGA AL CLIENTE HTTP CONFIRMADA (verificado). Radio de impacto ampliado con un punto de uso adicional no documentado previamente (`wallet_queries.py:105`). La severidad CRÍTICA por fiabilidad/disponibilidad ya asignada por el Reviewer a R3-CRIT-02 se mantiene y ahora cubre también el pago a proveedores.
+
+---
+
+### Verificación adicional — aislamiento por `provider_id` tras la reescritura de `task_queries.py` (sin hallazgos)
+
+El propio Reviewer, en el punto 5 de su handoff, recomendó repetir la verificación de aislamiento por `provider_id`/`client_id` sobre las funciones reescritas de `task_queries.py` **si** el WIP llegase a fusionarse, ya que su lógica interna cambió por completo aunque sus firmas no. Adelanté esa verificación ahora, en frío, en vez de esperar a que se decida el destino del WIP:
+
+- `get_assignment_with_task(assignment_id)` ya no filtra por `provider_id` en la query (ni lo hacía la versión anterior con psycopg2: el join solo filtraba por `id` de la asignación) — el campo `provider_id` se sigue devolviendo en el dict aplanado (línea 257 de la versión actual). Confirmé en `backend/app/routers/tasks.py` líneas 109–129 que la comprobación de propiedad sigue intacta en la capa de router: `if row["provider_id"] != current_provider["id"]: raise HTTPException(403, ...)`. **No hay regresión de autorización.**
+- `get_provider_assignments_history(provider_id)` sigue filtrando por `provider_id` dentro de la propia query (`.eq("provider_id", provider_id)`), igual que la versión anterior con SQL crudo (`WHERE ta.provider_id = %s`). **No hay regresión.**
+
+**Conclusión:** el WIP no introduce ningún problema nuevo de aislamiento/autorización entre proveedores. El riesgo de este WIP sigue siendo, según todo lo verificado por mí y por el Reviewer, de fiabilidad (crítico) y de higiene de secretos/logging (medio/bajo, hallazgos SEC-33 a SEC-35 arriba) — no de exposición cruzada de datos entre usuarios.
+
+---
+
+### Confirmaciones estándar de este ciclo
+
+**CORS (`backend/app/main.py` líneas 46–52):** confirmado correcto, sin cambios. `allow_origins=[settings.frontend_url]` (una única entrada, sin wildcard `*`), `allow_credentials=True`, sin ningún valor hardcodeado a `localhost` en el camino de producción (el default `"http://localhost:5173"` de `config.py` línea 18 es solo el valor de fallback para desarrollo local y se sobreescribe por variable de entorno en Railway). Coincide con lo ya confirmado por Backend Dev.
+
+**`/docs`, `/redoc`, `/openapi.json` en producción (`main.py` líneas 37–39):** confirmado correcto. Los tres quedan en `None` cuando `settings.is_production` es `True` (`docs_url=None if settings.is_production else "/docs"`, ídem `redoc_url` y `openapi_url`). `/health` (línea 100–104) también oculta el campo `environment` en producción, sin cambios este ciclo.
+
+**Secretos hardcodeados en código nuevo de este ciclo:** ninguno encontrado.
+- `frontend/src/pages/WalletPage.tsx`: el botón "Añadir créditos" (líneas 247–253) y su modal (líneas 514–533) son UI pura — un único `useState<boolean>` (`addCreditsOpen`), sin llamada a red, sin nuevo import de ningún cliente API. Grep de patrones de secreto sobre el fichero completo: cero coincidencias. Confirmado por lectura directa, no solo por el reporte del Reviewer.
+- `backend/app/db/supabase_client.py`: no contiene ningún valor hardcodeado — lee de `os.getenv`, no de literales. El riesgo de este fichero es estructural (SEC-33), no un secreto hardcodeado.
+- `backend/.env` existe en disco (pre-existente, ya documentado como SEC-19 en la auditoría de la feature de cómputo real) pero **no está trackeado por git** y **nunca apareció en el historial**: confirmado con `git ls-files backend/.env` (sin salida) y `git log --all --full-history -- backend/.env "**/.env"` (sin salida) ejecutados en este ciclo. La recomendación de rotar credenciales de SEC-19 sigue vigente y pendiente — no ha cambiado este ciclo.
+- Grep de `os.environ`, `settings.dict()`/`model_dump()` sobre `backend/app/`: cero coincidencias. No se ha añadido ningún endpoint ni script que vuelque configuración o variables de entorno.
+
+### Resumen ejecutivo de esta sección
+
+| Severidad | Cantidad | IDs |
+|-----------|----------|-----|
+| CRÍTICO   | 0        | — (la severidad crítica de este WIP es de fiabilidad, ya cubierta por el Reviewer; ver nota arriba) |
+| ALTO      | 0        | — |
+| MEDIO     | 2        | SEC-33, SEC-35 |
+| BAJO      | 1        | SEC-34 |
+| **Total** | **3**    | |
+
+Ninguno de los tres hallazgos de este ciclo es, por sí solo, bloqueante para producción. Los tres son mejoras de higiene de secretos/logging/documentación que deben aplicarse junto con el fix de fiabilidad de R3-CRIT-01/R3-CRIT-02 (Opción A o B del Reviewer), no en un ciclo separado — especialmente SEC-33, porque su fix natural es exactamente el mismo fix que ya resuelve R3-CRIT-01/R3-MAYOR-02 (eliminar `supabase_client.py` y usar `get_supabase()` en todo `task_queries.py`).
+
+### Constancia explícita — `docs/06-security.md` sigue vigente
+
+Tal como pide `briefs/05-vercel-creditos.md` en la sección "Roles con poco que hacer aquí" ("Security: repasa que `docs/06-security.md` sigue vigente sin cambios necesarios"), y respondiendo directamente al punto 4 del handoff del Reviewer en `docs/05-review.md` (que señaló, correctamente, que ningún rol dejó constancia escrita de haber revisado este ciclo desde el ángulo de seguridad):
+
+**He revisado este ciclo (brief 05, Vercel + botón "Añadir créditos") de forma explícita y con evidencia (ver "Método de verificación" arriba). Confirmo que:**
+
+1. El botón "Añadir créditos" (`WalletPage.tsx`) no introduce ninguna superficie de seguridad nueva: es UI sin llamada a red, sin secretos, sin estado persistente.
+2. CORS y la desactivación de `/docs`/`/redoc`/`/openapi.json` en producción siguen correctos, sin cambios respecto a lo ya auditado.
+3. El WIP de backend ajeno a este brief (migración psycopg2 → Supabase REST) **no** introduce ninguna fuga confirmada del `service_role_key` ni de connection strings hacia logs o hacia clientes HTTP, verificado con evidencia de código (no solo inferencia) — pero sí introduce tres hallazgos nuevos de higiene de seguridad de severidad MEDIO/BAJO (SEC-33, SEC-34, SEC-35), y no introduce ninguna regresión de aislamiento por `provider_id`.
+4. Todos los hallazgos de las dos auditorías anteriores de este documento (SEC-01 a SEC-32) siguen vigentes tal cual, sin cambios de estado en ningún caso: no encontré evidencia de que ninguno de ellos se haya corregido ni de que ninguno haya dejado de aplicar. En particular, siguen pendientes sin mitigar: la race condition de retiros (SEC-01), el JWT en `localStorage` (SEC-04), la ausencia de rate limiting (SEC-02, SEC-21), la cuenta demo en el seed (SEC-06), el Sybil attack en consenso (SEC-23), y las credenciales reales en `backend/.env` en disco (SEC-19, sin cambios este ciclo).
+5. No hay ningún cambio en el alcance de este ciclo (brief 05) que requiera modificar, retirar o matizar ningún hallazgo previo de este informe. **`docs/06-security.md` sigue vigente en su totalidad; esta sección es puramente aditiva.**
+
+---
+
+### Handoff para DevOps — ciclo Vercel + Créditos (seguridad)
+
+1. **No es necesaria ninguna acción de seguridad urgente derivada del botón "Añadir créditos"** — es UI sin superficie nueva. Sin acción.
+
+2. **Si se decide conservar el WIP de backend (Opción B del Reviewer) en vez de revertirlo (Opción A):** aplicar también SEC-33 (eliminar `supabase_client.py`, usar `get_supabase()` en `task_queries.py`) y SEC-34 (sustituir los tres `print()` por `logger.exception(...)` + re-raise) como parte del mismo fix — no como tareas separadas. Ambos ya quedan resueltos por el fix de fiabilidad que ya recomendó el Reviewer para R3-CRIT-01/R3-MAYOR-01/R3-MAYOR-02.
+
+3. **Independientemente de qué opción se elija para el WIP:** si `SUPABASE_DB_URL` se marca como variable de entorno en Railway, márquela explícitamente como **requerida** (no solo documentada en `DEPLOY.md`) — el fail-fast de `pydantic-settings` ya no puede ser la única red de seguridad para este campo mientras exista cualquier build en el árbol de trabajo que lo declare `Optional`. Esto cubre también el hallazgo nuevo de esta sección: el camino de pago a proveedores (`wallet_queries.py`) depende de la misma variable y no estaba mencionado explícitamente en el checklist de riesgo original.
+
+4. **Hardening de bajo costo, no bloqueante, para cuando se toque `config.py` de nuevo:** envolver `supabase_service_role_key` y `jwt_secret_key` con `pydantic.SecretStr` en vez de `str` (SEC-33). No es specific de este ciclo, pero este ciclo es la ocasión en la que más se ha hablado de ese campo.
+
+5. **Nada más requiere acción de DevOps derivada específicamente de este ciclo.** El resto de acciones pendientes (rate limiting, JWT en cookie, cuenta demo, rotación de `backend/.env`, etc.) ya están en los handoffs de las secciones anteriores de este mismo documento y no han cambiado.

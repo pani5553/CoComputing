@@ -339,7 +339,7 @@ Configurar los siguientes secretos en **GitHub → Settings → Secrets and vari
 
 ### Migraciones
 
-Las migraciones **no se aplican automaticamente** en Docker. Se aplican directamente contra Supabase usando la CLI de Supabase o el SQL Editor del panel web. Ejecutar siempre en orden: `001_schema.sql` → `002_rls.sql`.
+Las migraciones **no se aplican automaticamente** en Docker. Se aplican directamente contra Supabase usando la CLI de Supabase o el SQL Editor del panel web. El listado completo y actualizado de las 5 migraciones (`001_schema.sql` a `005_client.sql`) y su orden de ejecucion esta en `DEPLOY.md`, seccion "4 · Base de datos — migraciones en produccion" — se mantiene ahi como fuente unica para evitar que este README y `DEPLOY.md` diverjan.
 
 ### Checklist previo al despliegue
 
@@ -442,6 +442,12 @@ El script levanta varias instancias del worker en paralelo. Editar el script par
 **El worker ejecuta computo sin sandboxing.** El proceso Python descarga payloads de la API y los procesa directamente con polars en la maquina del worker. En el MVP, el payload solo contiene datos tabulares (no codigo ejecutable) y la comunicacion es HTTPS con JWT. Sin embargo, si la API o la base de datos fuesen comprometidas, un payload malicioso podria afectar a la maquina del worker.
 
 **Usar el worker unicamente en entornos de confianza para el MVP.** El sandboxing real (contenedor aislado con seccomp/AppArmor, verificacion HMAC del payload, ejecucion sin acceso a red) queda fuera del alcance de esta version y debe implementarse antes de usar el worker en produccion con datos de terceros no confiables.
+
+---
+
+## Placeholders conocidos
+
+- **Boton "Añadir creditos" (cartera del proveedor).** En `WalletPage.tsx`, junto a "Solicitar retiro", abre un modal informativo ("Muy pronto podras comprar creditos..."). Es solo interfaz: no llama a ningun endpoint, no crea estado persistente y no tiene todavia integracion de pagos real (tarjeta, PayPal, cripto) — queda pendiente para una futura iteracion. No confundir con la recarga de saldo del lado cliente, que si es funcional (`/cliente/recargar`, `POST /wallet/deposit`).
 
 ---
 

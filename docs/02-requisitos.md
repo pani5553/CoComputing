@@ -493,3 +493,31 @@ Las siguientes funcionalidades están explícitamente fuera del MVP y no deben s
 | Cartera (Wallet) | Registro financiero del proveedor con saldos y movimientos. |
 | Seed | Datos iniciales de prueba insertados en base de datos para hacer la plataforma demostrable. |
 | Slot | Plaza disponible en una tarea. Cada proveedor que acepta una tarea consume un slot. |
+
+---
+
+## 6. Ampliación — Verificación de Despliegue y Botón de Créditos (Placeholder)
+
+**Fecha:** 2026-07-06
+**Referencia:** `briefs/05-vercel-creditos.md`
+
+Esta ampliación añade un requisito funcional puntual y deja constancia de una verificación no funcional, ambos solicitados en el encargo de publicación en Vercel/Railway. No modifica ni invalida ningún requisito de las secciones anteriores.
+
+### RF-12: Botón "Añadir Créditos" en la Cartera (Placeholder)
+
+**Descripción:** La pantalla de cartera del proveedor incluye un botón "Añadir créditos", visible junto al botón de solicitud de retiro, que abre una ventana modal informativa indicando que la función de compra de créditos está en construcción.
+
+**Reglas de negocio:**
+- Este botón es exclusivamente un placeholder visual de cara a una futura integración de pagos. No implementa ninguna lógica de negocio real.
+- No existe endpoint de backend asociado a esta acción. No se realiza ninguna llamada a la API al pulsar el botón ni al cerrar el modal.
+- No se crea, modifica ni simula ningún saldo, transacción o registro de cartera como resultado de esta interacción.
+- Es independiente del flujo de recarga real del cliente (`POST /wallet/deposit`, ver brief `03-lado-cliente.md`) y del flujo de retiro del proveedor (RF-09c). Ninguno de los dos se ve alterado.
+
+**Criterios de aceptación:**
+- Al pulsar "Añadir créditos" en la cartera del proveedor, se abre una ventana modal con un mensaje del tipo "Muy pronto podrás comprar créditos. Función en construcción." y una acción para cerrarla.
+- Cerrar el modal no deja la pantalla de cartera en un estado inconsistente: saldos e historial de transacciones se muestran igual que antes de abrirlo.
+- Ninguna petición de red se dispara al interactuar con el botón o con el modal.
+
+### Nota de Verificación de Despliegue (no constituye un nuevo requisito de producto)
+
+Se ha revisado este documento de requisitos frente al estado actual del producto (MVP original más las features de cómputo real y lado cliente) con motivo de la verificación de preparación para despliegue en Vercel/Railway solicitada en `briefs/05-vercel-creditos.md`. **Conclusión: ningún requisito funcional o no funcional de este documento bloquea la publicación.** Las exclusiones de alcance ya declaradas en la sección 4 (pagos reales, notificaciones, apps móviles, panel de administración, etc.) siguen vigentes sin cambios y no son condición para publicar el producto tal como está definido.

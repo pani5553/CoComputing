@@ -467,3 +467,23 @@ polars>=0.20.0
 ```
 
 La dependencia `polars` solo es necesaria en el proceso worker. Para el backend FastAPI no se importa en el path de inicialización; el import ocurre únicamente dentro de `DataProcessingPlugin.process()`. Esto evita que un error de instalación de polars rompa el arranque de la API.
+
+---
+
+## Estructura adicional — Feature Lado Cliente (Escrow)
+
+Esta estructura ya está implementada (`briefs/03-lado-cliente.md`) pero no había quedado reflejada en este documento; se añade aquí una referencia mínima al detectarse durante la revisión de `briefs/05-vercel-creditos.md` (US-42 / CH-01). Sigue el mismo patrón aditivo que la sección anterior: no se modifica ningún fichero de la estructura ya descrita.
+
+**Backend** — añade el rol "cliente" reutilizando el patrón router → service → repository:
+
+- `app/routers/client.py` — prefijo `/client`: `POST /deposit`, `POST /tasks`, `GET /tasks`, `GET /tasks/{id}`, `POST /tasks/{id}/cancel`.
+- `app/services/client_service.py` — `deposit()`, `create_task()`, `get_my_tasks()`, `get_task_detail()`, `cancel_task()`.
+- `app/db/queries/client_queries.py` — `deposit_to_wallet()`, `hold_escrow()`, `get_escrow_by_task()`, `release_escrow_slot()`, `refund_escrow()`, `create_client_task()`, `get_client_tasks()`, `get_client_task_detail()`, `cancel_task_db()`.
+
+**Frontend:**
+
+- `src/pages/client/` — `DepositPage.tsx` (ruta `/cliente/recargar`), `PublishTaskPage.tsx` (`/cliente/publicar`), `MyTasksPage.tsx` (`/cliente/mis-tareas`), `ClientTaskDetailPage.tsx` (`/cliente/tareas/:taskId`).
+- `src/api/clientApi.ts` — funciones que llaman a los endpoints de `/client`.
+- Nota: `api/axios.ts` (así nombrado en el árbol de este documento) fue renombrado a `api/client.ts` durante esta feature para evitar colisión con el nuevo concepto de dominio "cliente"; su contenido (instancia Axios, interceptores JWT y de sesión expirada) no cambió.
+
+**Datos** (`migrations/005_client.sql`): añade `tasks.client_id` (uuid, nullable, FK → `providers`), amplía el `CHECK` de `transactions.tx_type` con `deposito`, `escrow`, `reembolso`, `pago_recibido`, y crea la tabla `escrows` (retención de fondos por tarea publicada: `amount_held`, `amount_released`, `status`).

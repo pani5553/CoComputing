@@ -1246,3 +1246,21 @@ providers (1) ─────────────────── (N) jobs
                           │
                           └── provider_id → providers (1)
 ```
+
+---
+
+## 13. Ampliación — Botón "Añadir Créditos" (Placeholder) y Verificación de Despliegue
+
+Esta sección responde al encargo de `briefs/05-vercel-creditos.md` (ver `docs/02-backlog.md`, US-42 y CH-01).
+
+### 13.1 US-42 — Botón "Añadir créditos": sin cambios de arquitectura
+
+El botón "Añadir créditos" de `WalletPage.tsx` es UI pura: al pulsarlo abre el componente `Modal` ya existente (`components/ui/Modal.tsx`) con un mensaje estático de "función en construcción" y una acción para cerrarlo. No dispara ninguna llamada HTTP, no introduce estado nuevo, no requiere ningún endpoint ni router nuevo, no modifica el modelo de datos y no toca ningún contrato de `docs/04-api-contracts.md`. **Backend Dev y Database Engineer no tienen ninguna tarea derivada de esta historia**: no hay endpoint que implementar ni tabla ni columna que crear o migrar. Es explícitamente distinto del flujo real de recarga del cliente (`POST /client/deposit`, brief 03), que esta historia no toca ni duplica.
+
+### 13.2 CH-01 — Verificación de despliegue: sin cambios de arquitectura
+
+La arquitectura de despliegue (SPA estática en Vercel + API FastAPI en Railway + Supabase Cloud, CORS restringido a `FRONTEND_URL`, `ENVIRONMENT=production` desactivando `/docs` y `/redoc`) quedó fijada en el brief `04-deploy-landing.md` y no cambia con esta ampliación. La verificación de que `DEPLOY.md` y `frontend/vercel.json` siguen reflejando el estado actual del código es un chore de revisión (propiedad de DevOps) y no introduce servicios, capas ni patrones nuevos. No hay nada bloqueante para autorizar la publicación desde el punto de vista de la arquitectura.
+
+### 13.3 Corrección menor detectada durante esta revisión
+
+Al releer este documento y `docs/04-estructura.md` para confirmar lo anterior, se detectó que ninguno de los dos reflejaba todavía la estructura de la feature "Lado Cliente" (brief 03), ya implementada en código: router `app/routers/client.py` (prefijo `/client`), `app/services/client_service.py`, `app/db/queries/client_queries.py`, la tabla `escrows` y la columna `tasks.client_id` (`migrations/005_client.sql`), y las pantallas `frontend/src/pages/client/*`. El diagrama de §1 y el listado de tablas de §11 de este documento describen el MVP original y, al igual que ocurrió con la feature de cómputo (§12, que tampoco se retroalimentó a §1), quedaron desactualizados antes de esta ampliación; no es un problema introducido por `briefs/05-vercel-creditos.md` ni bloquea el despliegue. Se añade una sección breve en `docs/04-estructura.md` ("Estructura adicional — Feature Lado Cliente") para dejar constancia mínima de estos ficheros, siguiendo el mismo patrón aditivo ya usado para cómputo, sin reescribir el diagrama ni el §11. No se añaden endpoints nuevos a `docs/04-api-contracts.md`: documentar formalmente los contratos de `/client` y `/client/deposit` queda fuera del alcance de esta ampliación.

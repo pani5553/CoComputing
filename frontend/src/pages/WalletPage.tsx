@@ -6,6 +6,7 @@ import {
   ArrowUpIcon,
   ArrowDownIcon,
   DocumentTextIcon,
+  PlusIcon,
 } from '@heroicons/react/24/outline'
 import { getWallet, getTransactions, withdraw } from '../api/wallet'
 import { extractErrorMessage } from '../api/client'
@@ -45,6 +46,9 @@ export default function WalletPage() {
   const [withdrawSuccess, setWithdrawSuccess] = useState<string | null>(null)
   const [destError, setDestError] = useState<string | null>(null)
   const [amountError, setAmountError] = useState<string | null>(null)
+
+  // Modal de añadir créditos (placeholder, sin funcionalidad real todavía)
+  const [addCreditsOpen, setAddCreditsOpen] = useState(false)
 
   async function loadWallet() {
     setLoading(true)
@@ -239,6 +243,13 @@ export default function WalletPage() {
                   disabled={wallet.available_balance < 10}
                 >
                   Solicitar retiro
+                </Button>
+                <Button
+                  variant="secondary"
+                  leftIcon={<PlusIcon className="h-4 w-4" />}
+                  onClick={() => setAddCreditsOpen(true)}
+                >
+                  Añadir créditos
                 </Button>
                 <p className="text-xs text-neutral-500">
                   Saldo mínimo para retirar: 10,00 CC
@@ -498,6 +509,27 @@ export default function WalletPage() {
             </div>
           </div>
         )}
+      </Modal>
+
+      {/* Modal de añadir créditos (placeholder, sin funcionalidad real todavía) */}
+      <Modal
+        isOpen={addCreditsOpen}
+        onClose={() => setAddCreditsOpen(false)}
+        title="Añadir créditos"
+        size="sm"
+      >
+        <div className="space-y-5">
+          <p className="text-sm text-neutral-400">
+            Muy pronto podrás comprar créditos (CC) con tarjeta o PayPal. Esta función
+            está en construcción.
+          </p>
+
+          <div className="border-t border-neutral-700 pt-4 flex justify-end">
+            <Button variant="primary" onClick={() => setAddCreditsOpen(false)}>
+              Entendido
+            </Button>
+          </div>
+        </div>
       </Modal>
     </div>
   )

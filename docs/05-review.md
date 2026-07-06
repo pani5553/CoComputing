@@ -1076,3 +1076,252 @@ Los puntos de seguridad específicos de esta feature que el Security Auditor deb
 5. **`GET /jobs/{id}/result` leakea información de estado**: El endpoint devuelve el estado actual del job en el mensaje de error aunque el job no sea del cliente autenticado — la verificación de ownership se hace correctamente en `get_job_status`, pero vale la pena confirmar que el 403 no filtra información del job ajeno en el `detail`.
 
 6. **Consenso gamificable**: Un proveedor puede registrarse con múltiples cuentas y procesar el mismo chunk dos veces como "réplicas distintas", obteniendo doble recompensa y garantizando consenso artificialmente. La única protección actual es la constraint `UNIQUE (chunk_id, provider_id)` en `chunk_results`, que previene el doble submit con la misma cuenta pero no con cuentas Sybil.
+
+---
+
+## Revisión — Publicación Vercel + Botón "Añadir créditos" — 2026-07-06
+
+**Revisor:** Code Reviewer Senior
+**Referencia:** `briefs/05-vercel-creditos.md`
+**Escala de severidad de este ciclo:** CRÍTICO / MAYOR / MENOR
+**Alcance:** (A) hallazgo de QA sobre WIP de backend ajeno al brief, verificado de forma independiente; (B) entregables reales del brief 05 (`WalletPage.tsx`, `docs/02-backlog.md`, `docs/02-requisitos.md`, `docs/04-arquitectura.md`, `docs/04-estructura.md`, `DEPLOY.md`, `README.md`, `frontend/vercel.json`).
+
+### Método de verificación
+
+No me he limitado a leer el reporte de QA: he leído los tres ficheros del WIP línea a línea, comparado contra `git diff`/`git show HEAD`, y además reproducido el fallo de forma aislada sin tocar el árbol de trabajo real:
+
+1. Escribí un `.env` limpio (valores ficticios pero bien formados) en un directorio temporal fuera del repo y ejecuté `import app.main` con `PYTHONPATH` apuntando al `backend/` real, sin exportar variables de entorno al proceso (para reproducir exactamente el escenario "solo `.env`, nadie llama a `load_dotenv()`"). Resultado: `supabase._sync.client.SupabaseException: supabase_url is required`, lanzada en `app/db/supabase_client.py` línea 7, con la cadena de import exacta `app.main → app.routers.tasks → app.db.queries.task_queries → app.db.supabase_client`.
+2. Con `git archive HEAD -- backend` exporté una copia limpia de `backend/` tal como está en `git HEAD` a un directorio temporal (sin tocar el árbol de trabajo real ni usar `git stash`/`checkout`), le copié el mismo `.env` de prueba, y ejecuté `pytest`. Resultado: la suite recoge y ejecuta **71 tests** en total (19 passed + 52 con error de fixture por un `bcrypt 5.0.0` instalado globalmente en esta máquina frente al `bcrypt==4.0.1` fijado en `requirements.txt` — un problema de entorno local ajeno a este ciclo, no relacionado con el diff revisado) — pero **cero errores de import/collection**, en contraste con el colapso total del WIP. El número total de tests (71) coincide exactamente con el reportado por QA.
+3. Confirmé con `git status` antes y después que el árbol de trabajo real no quedó alterado por esta verificación.
+4. Para el botón de créditos, ejecuté `npm run build` (`tsc && vite build`) de forma independiente sobre el frontend real: compila sin errores (`✓ built in 2.05s`), confirmando la afirmación de QA también en el lado frontend.
+
+Con esto considero el hallazgo de QA **confirmado por mi propia lectura y por reproducción directa**, no solo por su reporte.
+
+---
+
+### Índice de hallazgos de este ciclo
+
+| ID | Severidad | Resumen |
+|----|-----------|---------|
+| R3-CRIT-01 | CRÍTICO | `backend/app/db/supabase_client.py` construye el cliente Supabase en tiempo de import con `os.getenv` crudo → `SupabaseException: supabase_url is required` → rompe el import de `app.main` y por tanto el 100% de la suite de tests y cualquier arranque local sin variables de entorno reales exportadas |
+| R3-CRIT-02 | CRÍTICO | `supabase_db_url` pasó de obligatorio a `Optional[str] = None` en `config.py` → elimina el fail-fast de arranque para todo el código que sigue usando psycopg2 directo (escrow del cliente, jobs de cómputo) |
+| R3-MAYOR-01 | MAYOR | Tres funciones reescritas en `task_queries.py` capturan `except Exception` genérico y devuelven un valor "vacío" (`False`/`[]`/`None`) en vez de propagar el error — oculta fallos de infraestructura como si fueran resultados de negocio legítimos ("no quedan plazas", "sin historial") |
+| R3-MAYOR-02 | MAYOR | Dos clientes Supabase distintos coexisten y se usan de forma inconsistente dentro del mismo fichero (`get_supabase()` de `app/db/client.py` vs. el `supabase` module-level de `app/db/supabase_client.py`) — es la causa raíz concreta de R3-CRIT-01 |
+| R3-MENOR-01 | MENOR | `DEPLOY.md` no fue actualizado con las rutas `/jobs/*` y `/cliente/*` en el checklist final, pese a que el brief lo pide explícitamente a DevOps |
+| R3-MENOR-02 | MENOR | `README.md` no fue actualizado con la línea sobre el placeholder de "Añadir créditos" que el brief pide explícitamente a Tech Writer |
+| R3-MENOR-03 | MENOR | Checklist de despliegue duplicado y ya divergente entre `README.md` y `DEPLOY.md` (preexistente, no introducido este ciclo, pero directamente relevante al chore de verificación de este ciclo) |
+
+---
+
+### Parte A — Hallazgo crítico reportado por QA (código de otra sesión, ajeno al brief 05)
+
+#### R3-CRIT-01 — `supabase_client.py` crea el cliente en import-time con `os.getenv` crudo; rompe el import de toda la aplicación
+
+**Archivo:** `backend/app/db/supabase_client.py` (fichero nuevo, sin trackear, 7 líneas completas)
+
+```python
+from supabase import create_client
+import os
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)   # línea 7 — se ejecuta al importar el módulo
+```
+
+**Archivo relacionado:** `backend/app/db/queries/task_queries.py` línea 9: `from app.db.supabase_client import supabase`.
+**Archivo relacionado:** `backend/tests/conftest.py` línea 17: `from app.main import app` (a nivel de módulo).
+
+**Descripción:**
+No hay ningún punto de la aplicación que llame a `load_dotenv()` antes de que se ejecute este import (confirmado por grep: la única llamada a `load_dotenv` en todo `backend/` está en `backend/app/seed/seed.py`, un script standalone que no forma parte del arranque de `app.main`). `pydantic-settings` (usado en `app/core/config.py`) sí sabe leer `.env` directamente porque implementa su propio parser, pero eso **no** rellena `os.environ` — son mecanismos independientes. Por tanto, en cualquier entorno donde las credenciales solo estén en `.env` (el flujo normal descrito en el propio `README.md`: "Editar `.env` con tus credenciales..."), `os.getenv("SUPABASE_URL")` devuelve `None`, y `create_client(None, None)` lanza `SupabaseException: supabase_url is required` **en el momento de importar el módulo**, no en el primer uso.
+
+Como `task_queries.py` importa este módulo a nivel de fichero, y `app/routers/tasks.py` importa `task_queries`, y `app/main.py` importa los routers, y `conftest.py` importa `app.main` a nivel de módulo (línea 17) — la cadena de imports hace que **cualquier** `pytest` (sobre cualquier fichero de test) falle en la fase de *collection*, antes de ejecutar un solo test.
+
+**Verificación propia (no solo el reporte de QA):** ver "Método de verificación" arriba. Reproduje el `SupabaseException` de forma aislada y confirmé que en `git HEAD` (sin este fichero) la suite recoge sus 71 tests con normalidad.
+
+**Impacto:** Bloqueante total. Rompe CI, rompe `pytest` local para cualquier desarrollador que no tenga las variables exportadas como variables de entorno reales del sistema (que es el caso normal siguiendo el propio `README.md`), y rompe el arranque de `uvicorn app.main:app` en el mismo escenario.
+
+**Fix sugerido — dos opciones independientes:**
+
+- **Opción A (recomendada):** Revertir los 3 ficheros de este WIP a `git HEAD`, ya que es contenido de otra sesión, ajeno a cualquier brief activo (ni `04-deploy-landing.md` ni `05-vercel-creditos.md` piden esta migración):
+  ```
+  git checkout -- backend/app/core/config.py backend/app/db/queries/task_queries.py
+  rm backend/app/db/supabase_client.py
+  ```
+
+- **Opción B (si se quiere conservar la migración a REST):** Reescribir `supabase_client.py` para reutilizar el patrón perezoso ya existente en `backend/app/db/client.py` (lee de `app.core.config.settings`, `@lru_cache`, inicialización diferida al primer uso) en vez de crear un segundo cliente *eager* con `os.getenv` crudo. Combinado con el fix de R3-MAYOR-02, esto probablemente elimina la necesidad del fichero nuevo por completo: basta con que `task_queries.py` línea 150 use `get_supabase()` (como el resto del fichero) en vez de importar `supabase` de un módulo aparte.
+
+---
+
+#### R3-CRIT-02 — `supabase_db_url` pasa a opcional; elimina el fail-fast para todo el código psycopg2 restante
+
+**Archivo:** `backend/app/core/config.py`, línea 10 (línea 3 añade el import `from typing import Optional`)
+
+```python
+# git HEAD:
+supabase_db_url: str
+# WIP actual:
+supabase_db_url: Optional[str] = None
+```
+
+**Descripción:** Confirmado por `git diff` y por lectura directa. Este campo es leído con `pydantic-settings`, que antes lo declaraba obligatorio: si faltaba `SUPABASE_DB_URL` en el entorno, `Settings()` fallaba con un `ValidationError` claro ("Field required") **al arrancar el proceso**. Con el cambio, `Settings()` construye sin problema aunque la variable no exista, sustituyéndola por `None`. El primer síntoma visible pasa a ser, más tarde, un `psycopg2.OperationalError` confuso ("could not connect to server... Unix socket") en la primera request que toque escrow o cómputo — exactamente el "error de conexión a socket local" que el propio `briefs/05-vercel-creditos.md` (sección DevOps) describe como el riesgo a vigilar para `SUPABASE_DB_URL`.
+
+**Esto agrava un riesgo que el propio brief de este ciclo pide verificar, no que introduce él:** el brief 05 le pide a DevOps confirmar que la ausencia de `SUPABASE_DB_URL` sigue documentada en `DEPLOY.md` precisamente porque "rompe en silencio" el código con psycopg2 directo. Este WIP no toca `DEPLOY.md`, pero sí desactiva la única red de seguridad real que existía contra ese riesgo — el fail-fast de arranque —, convirtiendo un fallo detectable de inmediato (contenedor no arranca) en un fallo diferido y confuso (contenedor arranca "bien", las requests de escrow/cómputo fallan una a una).
+
+**Confirmado por lectura — código que depende de `supabase_db_url` sin comprobar `None`:**
+- `backend/app/db/queries/client_queries.py`: 7 funciones con `psycopg2.connect(settings.supabase_db_url, ...)` sin ningún guard — `deposit_to_wallet` (línea 28-29), `hold_escrow` (línea 64-66), `release_escrow_slot` (línea 118-120), `refund_escrow` (línea 147-149), `get_client_tasks` (línea 238-240), `get_client_task_detail` (línea 288-290), `cancel_task_db` (línea 318-320).
+- `backend/app/db/queries/compute_queries.py`: 4 ocurrencias del mismo patrón (líneas 129-130, 217-218, 362-363, 385-386).
+
+**Impacto:** Si este WIP se desplegara y faltara `SUPABASE_DB_URL` en Railway (un error de configuración perfectamente plausible: es la única variable de las 7 documentadas en `DEPLOY.md` que no sigue el patrón `SUPABASE_*` obvio de copiar-pegar desde el panel de Supabase), el sistema de escrow del cliente y los jobs de cómputo real fallarían en producción de forma confusa, request a request, en vez de que el despliegue fallase inmediatamente y de forma diagnosticable.
+
+**Fix sugerido:**
+- Revertir a `supabase_db_url: str` (obligatorio), salvo que exista un plan concreto y ya ejecutado para eliminar por completo psycopg2 del proyecto (hoy sigue siendo el mecanismo principal de escrow y cómputo, ver arriba).
+- Si se necesita que sea opcional por alguna razón de despliegue gradual, añadir una validación explícita que falle alto, por ejemplo un `@model_validator(mode="after")` en `Settings` que levante `ValueError` si `supabase_db_url` es `None`, en vez de dejar que el primer síntoma sea un error de socket dentro de psycopg2.
+
+---
+
+### Otros hallazgos en el mismo WIP, no reportados por QA
+
+#### R3-MAYOR-01 — `except Exception` genérico oculta errores de infraestructura como resultados de negocio válidos
+
+**Archivo:** `backend/app/db/queries/task_queries.py`:
+- `decrement_slots_atomic`, líneas 74–97 (particularmente 95–97: `except Exception as e: print(...); return False`)
+- `get_provider_assignments_history`, líneas 149–174 (particularmente 172–174: `except Exception as e: print(...); return []`)
+- `get_assignment_with_task`, líneas 234–262 (particularmente 261–263: `except Exception as e: print(...); return None`)
+
+**Descripción:** Estas tres funciones son las únicas del fichero (de 10 funciones totales) que envuelven su lógica en un `try/except Exception` de propósito general. Ninguna de las otras siete (`get_tasks`, `get_task_by_id`, `get_assignment_by_id`, `get_active_assignment_for_provider_task`, `create_assignment`, `update_assignment_status`, `count_provider_assignments_by_status`) lo hace — dejan que la excepción se propague, que es el patrón establecido en el resto del proyecto: `app/main.py` ya registra un `@app.exception_handler(Exception)` (línea 73) que hace `logger.exception(...)` y responde 500. Este patrón nuevo, aplicado solo a estas tres funciones, revierte esa decisión de diseño localmente: un error real de red, de autenticación contra Supabase, o un cambio de esquema, se indistingue de "no quedan plazas" (`decrement_slots_atomic` → `False`), "sin historial de asignaciones" (`get_provider_assignments_history` → `[]`) o "asignación no encontrada" (`get_assignment_with_task` → `None`, que el router típicamente traduce en un 404).
+
+Además, el error se reporta con `print(f"...: {e}")` en vez de con el `logging` que usa el resto del proyecto (`logging.getLogger("co-computing")` en `main.py`) — en un contenedor de producción, `print()` a stdout puede no capturarse con el mismo nivel/formato/agregación que el logger estructurado, y ya se pierde el `exc_info` (traceback) que sí captura `logger.exception`.
+
+**Impacto:** Un fallo transitorio de conexión a Supabase durante `decrement_slots_atomic` haría que un proveedor reciba "ya no quedan plazas" para una tarea que en realidad sí tiene plazas libres (falso negativo de negocio por un problema de infraestructura). Lo mismo aplica a un historial que aparece vacío o una asignación que aparece "no encontrada" (404) cuando en realidad existe pero la llamada a Supabase falló por otra razón.
+
+**Fix sugerido:** Eliminar el `try/except` de las tres funciones y dejar que la excepción se propague al handler genérico de `main.py` (igual que las otras siete funciones del mismo fichero). Si se quiere loggear antes de propagar, usar el logger del proyecto y re-lanzar:
+```python
+except Exception:
+    logger.exception("Error decrementando slots para task_id=%s", task_id)
+    raise
+```
+
+---
+
+#### R3-MAYOR-02 — Dos clientes Supabase distintos coexisten en el mismo fichero (causa raíz de R3-CRIT-01)
+
+**Archivo:** `backend/app/db/queries/task_queries.py`, línea 8 vs. línea 9 y línea 150
+**Archivo relacionado:** `backend/app/db/client.py` (patrón ya existente, correcto)
+
+**Descripción:**
+```python
+from app.db.client import get_supabase           # línea 8 — patrón perezoso, lee de settings
+from app.db.supabase_client import supabase       # línea 9 — patrón eager, lee de os.getenv crudo
+```
+Nueve de las diez funciones del fichero usan `get_supabase()` (el singleton perezoso ya establecido en `app/db/client.py`, con `@lru_cache`, que lee de `app.core.config.settings`). Solo `get_provider_assignments_history` (línea 150) usa el segundo cliente, `supabase.table(...)`, importado del fichero nuevo. No hay ninguna razón funcional para esta diferencia — es, en la práctica, deuda técnica y duplicación introducida a mitad de una migración: dos mecanismos para obtener lo que debería ser el mismo objeto, con comportamientos de inicialización distintos (perezoso vs. eager) y distintas fuentes de configuración (pydantic-settings vs. `os.getenv` crudo).
+
+**Impacto:** Además de ser la causa raíz directa y aislable de R3-CRIT-01 (ver Opción B arriba), esta duplicación es fuente probable de bugs futuros: cualquiera que edite este fichero copiando el patrón de la línea 150 en vez del de las otras nueve funciones reintroducirá el mismo problema.
+
+**Fix sugerido:** Eliminar `app/db/supabase_client.py` y la importación de la línea 9; cambiar la línea 150 de `supabase.table(...)` a `get_supabase().table(...)`.
+
+---
+
+### Parte B — Entregables reales del brief 05
+
+#### Frontend — botón "Añadir créditos" (`frontend/src/pages/WalletPage.tsx`)
+
+**Confirmado limpio, sin hallazgos.** Revisé el diff completo y el fichero resultante:
+- El botón (líneas 247–253) usa `variant="secondary"` y `leftIcon`, consistente con el resto de botones ya existentes en la misma pantalla.
+- El modal (líneas 514–533) reutiliza el componente `Modal` existente; el prop `size="sm"` que usa por primera vez en este fichero existe y está tipado en `components/ui/Modal.tsx` (línea 10: `size?: 'sm' | 'md' | 'lg'`) — no es un prop inventado.
+- Estado nuevo: un único `useState<boolean>` (`addCreditsOpen`, línea 51) sin persistencia ni llamada a red. No hay ningún `import` de `api/wallet` ni de `api/clientApi` añadido para este botón.
+- No toca `frontend/src/pages/client/DepositPage.tsx` (confirmado: no aparece en `git status` como modificado) ni su lógica de `POST /client/deposit` — leí `DepositPage.tsx` para confirmar que su flujo (usa `deposit()` de `api/clientApi`, con `PRESETS`, validación de importe, pantalla de éxito) es completamente independiente y no se solapa con el placeholder nuevo.
+- Verificación independiente: ejecuté `npm run build` (`tsc && vite build`) sobre el frontend real → compila y bundlea sin errores (`✓ built in 2.05s`), confirmando que no hay regresión de tipos ni de build en ninguna de las pantallas existentes.
+
+#### Documentación (`docs/02-backlog.md`, `docs/02-requisitos.md`, `docs/04-arquitectura.md`, `docs/04-estructura.md`)
+
+**Confirmado coherente, sin hallazgos de fondo.** Las cuatro ampliaciones (US-42, CH-01, RF-12, §13 de arquitectura, sección adicional de estructura) son aditivas, no reescriben contenido previo, y son honestas sobre su propio alcance: explicitan que no hay tarea derivada para Backend Dev ni Database Engineer (correcto: no hay endpoint ni migración nueva), y el Product Owner dejó constancia explícita de que ningún requisito bloquea la publicación. Como detalle positivo: `docs/04-arquitectura.md` §13.3 detecta por iniciativa propia que la feature de "Lado Cliente" (brief 03) nunca quedó reflejada en el diagrama de arquitectura ni en `docs/04-estructura.md`, lo señala explícitamente como deuda preexistente (no introducida por este ciclo) y añade una sección mínima aditiva a `docs/04-estructura.md` para dejar constancia — confirmé que esa sección efectivamente existe al final del fichero. Buena disciplina de documentación.
+
+#### `frontend/vercel.json` — confirmado correcto, sin cambios necesarios
+
+El rewrite `{ "source": "/(.*)", "destination": "/index.html" }` es un catch-all: cualquier ruta nueva del cliente (`/cliente/*`) o de cómputo (`/jobs/*`) ya funciona sin tocar este fichero. Coherente con que no aparezca en el diff de este ciclo.
+
+#### `backend/app/main.py` — confirmado correcto, sin cambios necesarios
+
+`docs_url=None if settings.is_production else "/docs"` (línea 37) y CORS con `allow_origins=[settings.frontend_url]` (línea 48, sin wildcard) siguen correctos; no hay ningún valor hardcodeado a `localhost` en el camino de producción (el default `"http://localhost:5173"` de `frontend_url` en `config.py` línea 18 es solo el valor por defecto para desarrollo local, y se sobreescribe por variable de entorno en Railway). Coherente con que Backend Dev no tuviera cambios que hacer este ciclo.
+
+#### Migraciones 001–005 en `DEPLOY.md` — confirmado correcto
+
+`DEPLOY.md` líneas 133–139 listan las 5 migraciones en orden (003 se referencia explícitamente con la advertencia de no ejecutar la cuenta demo en producción, no es una omisión). Correcto, sin hallazgos.
+
+---
+
+#### R3-MENOR-01 — `DEPLOY.md` no actualizado con las rutas nuevas pese a que el brief lo pide explícitamente
+
+**Archivo:** `DEPLOY.md`, sección "## 5 · Checklist final antes de publicar", líneas 147–155
+
+**Descripción:** El brief (sección DevOps) pide explícitamente: *"Actualiza el checklist final de `DEPLOY.md` con cualquier ruta nueva a probar (`/cliente/*`, `/jobs/*`)"*. `DEPLOY.md` no aparece en los ficheros modificados de este ciclo (`git diff --stat` no lo incluye) — el checklist actual (líneas 149–155) solo cubre `/health`, `/docs`, la landing, `/registro`, `/login` y `/dashboard`; no hay ningún ítem para verificar `/cliente/*` ni `/jobs/*` tras el despliegue.
+
+**Impacto:** Bajo — es un checklist manual para el humano que despliega, no afecta al código. Pero es exactamente el ítem que el brief de este ciclo asignó a DevOps y no tiene evidencia de haberse hecho.
+
+**Fix sugerido:** Añadir al checklist de la línea 155:
+```
+- [ ] El flujo de cliente (`/cliente/publicar`, `/cliente/mis-tareas`, `/cliente/recargar`) funciona contra el backend de producción
+- [ ] El flujo de cómputo (`/jobs`, `/jobs/nuevo`, `/jobs/:id`) funciona contra el backend de producción
+```
+
+---
+
+#### R3-MENOR-02 — `README.md` no actualizado con la línea de placeholder que el brief pide explícitamente a Tech Writer
+
+**Archivo:** `README.md` (ningún cambio en este ciclo; confirmado por `git log --oneline -- README.md`, el último commit que lo tocó es anterior a los brief 04 y 05)
+
+**Descripción:** El brief pide explícitamente a Tech Writer: *"Añade una línea en `README.md` (funcionalidades o roadmap) indicando que 'Añadir créditos' es un placeholder pendiente de integración de pagos reales."* Confirmado por búsqueda de texto: cero coincidencias de "créditos", "placeholder" o "roadmap" en todo `README.md`.
+
+**Fix sugerido:** Añadir una subsección breve, por ejemplo junto a "## Computo Real Distribuido (feature v2)" (línea 357):
+```markdown
+### Placeholders conocidos
+
+- El botón "Añadir créditos" de la cartera del proveedor (`WalletPage`) es únicamente
+  informativo: abre un modal indicando que la función está en construcción. No hay
+  integración de pagos real (Stripe, PayPal, cripto) todavía.
+```
+
+---
+
+#### R3-MENOR-03 — Checklist de despliegue duplicado y ya divergente entre `README.md` y `DEPLOY.md` (preexistente)
+
+**Archivo 1:** `README.md`, líneas 340–353 ("### Migraciones" y "### Checklist previo al despliegue")
+**Archivo 2:** `DEPLOY.md`, líneas 129–155 ("## 4 · Base de datos — migraciones" y "## 5 · Checklist final")
+
+**Descripción:** Existen dos checklists de despliegue independientes que ya han divergido: la nota de migraciones de `README.md` (línea 342) solo menciona `001_schema.sql → 002_rls.sql`, sin mencionar 003/004/005, mientras que `DEPLOY.md` sí las lista todas correctamente (líneas 133–139). Ninguna de las dos copias incluye las rutas `/cliente/*`/`/jobs/*` (ver R3-MENOR-01). Esto no lo introduce este ciclo — ya eran dos ficheros separados desde el brief 04 — pero es precisamente el tipo de deuda que el chore CH-01 de este mismo ciclo ("verificación de preparación para despliegue") se proponía detectar, y no se detectó.
+
+**Fix sugerido:** Consolidar en una única fuente de verdad. Recomendado: mantener el checklist detallado en `DEPLOY.md` (es el documento operativo pensado para el momento del despliegue) y sustituir en `README.md` las líneas 340–353 por una referencia corta: *"Ver checklist completo de despliegue en `DEPLOY.md` §4–5."*
+
+---
+
+### Resumen ejecutivo de esta revisión
+
+| Severidad | Cantidad | IDs |
+|-----------|----------|-----|
+| CRÍTICO   | 2        | R3-CRIT-01, R3-CRIT-02 |
+| MAYOR     | 2        | R3-MAYOR-01, R3-MAYOR-02 |
+| MENOR     | 3        | R3-MENOR-01, R3-MENOR-02, R3-MENOR-03 |
+| **Total** | **7**    | |
+
+**Sobre los entregables reales del brief 05** (botón "Añadir créditos" + documentación de producto/arquitectura): sin hallazgos de fondo, verificados de forma independiente (lectura completa + `npm run build` real). Tal como anticipaba el encargo, esta parte fue trivial y está bien resuelta.
+
+**Sobre el WIP de backend ajeno al brief** (migración psycopg2 → Supabase REST, encontrada sin commitear en el árbol de trabajo): **veredicto BLOQUEANTE**. No es responsabilidad de este ciclo (ningún brief activo pidió esta migración) pero convive en el mismo árbol de trabajo y, si se commitea o despliega tal cual, rompe el 100% de los tests (R3-CRIT-01) y desactiva una protección crítica de arranque para el código de dinero real (escrow, cómputo — R3-CRIT-02). Confirmo con mi propia lectura y con reproducción aislada (no solo el reporte de QA) que ambos hallazgos son reales y del todo verificables. El usuario humano debe decidir entre:
+- **Opción A:** revertir `backend/app/core/config.py`, `backend/app/db/queries/task_queries.py` a `git HEAD` y borrar `backend/app/db/supabase_client.py` (ninguno de los tres está en el alcance de brief 04 ni 05).
+- **Opción B:** conservar la migración a REST pero corrigiendo R3-CRIT-01/02/R3-MAYOR-01/R3-MAYOR-02 primero (detalles de fix en cada hallazgo arriba).
+
+**Sobre el proceso de este ciclo:** a diferencia de Product Owner y Architect, que dejaron constancia explícita por escrito de su verificación ("no hay nada bloqueante...", ver `docs/02-backlog.md` y `docs/02-requisitos.md`), no encontré ningún rastro escrito de que DevOps, Tech Writer o Security hayan ejecutado su parte de este ciclo — y en el caso concreto de DevOps/Tech Writer, los ficheros que se les pedía tocar (`DEPLOY.md`, `README.md`) no tienen ningún cambio (R3-MENOR-01, R3-MENOR-02). Recomiendo que futuros ciclos exijan una confirmación explícita por escrito incluso cuando la conclusión sea "sin cambios necesarios".
+
+---
+
+### Handoff al Security Auditor — ciclo Vercel + Créditos
+
+1. **Máxima prioridad — R3-CRIT-02 (`supabase_db_url` opcional):** si el WIP backend descrito arriba llegase a fusionarse en cualquier forma, verificar que exista una red de seguridad a nivel de plataforma (variable marcada como obligatoria en Railway, o un healthcheck que ejercite realmente una conexión psycopg2 antes de aceptar tráfico) — el fail-fast de pydantic-settings ya no es suficiente por sí solo.
+
+2. **R3-CRIT-01 / R3-MAYOR-02 (`supabase_client.py`, cliente Supabase duplicado):** confirmar que `SUPABASE_SERVICE_ROLE_KEY` (clave que salta todo RLS, ya señalada en el handoff de la revisión inicial, punto 7) no queda expuesta por este código nuevo. No la vi loggeada directamente, pero el patrón `os.getenv` crudo sin validar añade una superficie más donde alguien podría añadir un `print(SUPABASE_KEY)` de debug con más facilidad que en el patrón perezoso de `app/db/client.py`.
+
+3. **R3-MAYOR-01 (`print(f"...: {e}")` en `task_queries.py`):** los mensajes de excepción de `psycopg2`/`supabase-py` a veces incluyen fragmentos del DSN o de la URL de conexión. Confirmar que ninguno de estos tres `print()` puede terminar filtrando información sensible a los logs del contenedor (stdout no estructurado, sin el control de nivel/formato que sí tiene `logging`). Relacionado con el punto 7 del handoff de la revisión inicial ("secretos en logs de CI").
+
+4. **Confirmar explícitamente que `docs/06-security.md` sigue vigente**, tal como pide el brief 05 — no encontré ninguna constancia escrita de esta confirmación en este ciclo (ver nota de proceso arriba); sería bueno que quedase registrada, aunque sea en una línea, para mantener la trazabilidad que sí mostraron Product Owner y Architect.
+
+5. Todo lo señalado en los handoffs de seguridad de los dos ciclos anteriores (race conditions financieras, JWT en localStorage, rate limiting, RLS inactivo para JWT propio, cuenta demo, worker con credenciales en CLI, ausencia de timeout de asignación de chunks, consenso gamificable con cuentas Sybil) sigue vigente y no se ha vuelto a tocar en este ciclo — no hace falta re-auditarlo salvo que el WIP de backend descrito en la Parte A se termine fusionando, en cuyo caso recomiendo repetir específicamente el punto 5 del handoff original (verificación de aislamiento por `provider_id`/`client_id` en cada endpoint) sobre las funciones reescritas de `task_queries.py`, ya que su lógica interna cambió por completo aunque sus firmas no.

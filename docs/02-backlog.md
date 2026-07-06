@@ -1344,3 +1344,69 @@ US-38 (Validación por consenso) → US-39 (Pago y trust score) → US-37 (Panta
 
 **Sprint 9 — Calidad y cierre:**
 US-40 (Tests E2E del pipeline) → validación de no-regresión → build TypeScript limpio
+
+---
+
+## Ampliación: Verificación de Despliegue y Placeholder de Créditos
+
+**Versión:** 1.2
+**Fecha:** 2026-07-06
+**Referencia:** `briefs/05-vercel-creditos.md`
+
+Esta sección añade al backlog dos elementos puntuales derivados del encargo de verificación de despliegue en Vercel/Railway: una user story de UI para el botón "Añadir créditos" en la cartera del proveedor (placeholder sin funcionalidad real), y una entrada de tipo chore/infraestructura para la verificación de que el proyecto sigue listo para publicarse. Ninguno de los dos introduce alcance de producto adicional al aquí descrito; no se crean épicas nuevas.
+
+---
+
+#### US-42 — Botón "Añadir créditos" en la cartera (placeholder)
+
+**Prioridad:** Could Have
+**Estimación:** XS (1 punto)
+**Épica:** E-06 (Cartera)
+
+**Historia:**
+Como proveedor autenticado que consulta su cartera,
+quiero ver un botón "Añadir créditos" junto al botón de solicitud de retiro,
+para saber que en el futuro podré recargar saldo directamente, aunque hoy la función todavía no esté disponible.
+
+**Criterios de aceptación:**
+
+1. **Botón visible:** En la pantalla de cartera del proveedor (`WalletPage`), junto al botón "Solicitar retiro", aparece un botón "Añadir créditos" con el mismo estilo visual que el resto de acciones de la pantalla.
+
+2. **Apertura de modal informativo:** Al pulsar el botón, se abre una ventana modal (reutilizando el componente `Modal` existente) con un mensaje que indica claramente que la función está en construcción (p. ej. "Muy pronto podrás comprar créditos. Función en construcción.") y una acción para cerrarla.
+
+3. **Sin llamada a backend:** Pulsar el botón o interactuar con el modal no genera ninguna petición HTTP a la API. No existe ningún endpoint nuevo asociado a esta acción.
+
+4. **Sin persistencia de estado:** No se crea, modifica ni simula ningún saldo, transacción o registro de cartera como resultado de esta interacción. Cerrar y reabrir el modal, o recargar la página, no deja rastro alguno de la interacción.
+
+5. **No interfiere con flujos existentes:** El botón y su modal son independientes del flujo de recarga real del cliente (`POST /wallet/deposit`, brief `03-lado-cliente.md`) y del flujo de retiro del proveedor (US-17). Ninguno de los dos se ve alterado por esta historia.
+
+6. **Cierre limpio del modal:** Tras cerrar el modal, la pantalla de cartera permanece en un estado consistente: saldos e historial de transacciones se muestran exactamente igual que antes de abrirlo.
+
+7. **Fuera de alcance explícito:** Esta historia no incluye integración con ningún medio de pago real, backend ni persistencia. La compra real de créditos queda como funcionalidad futura, fuera de este alcance.
+
+---
+
+#### CH-01 — Verificación de preparación para despliegue en Vercel/Railway
+
+**Tipo:** Chore técnico / infraestructura (no es una feature de producto)
+**Prioridad:** Must Have (bloqueante para autorizar la publicación)
+**Referencia:** `DEPLOY.md`, `frontend/vercel.json`, brief `04-deploy-landing.md`, brief `05-vercel-creditos.md`
+
+**Descripción:**
+Como equipo responsable de la publicación de Co-Computing,
+queremos confirmar que la documentación y configuración de despliegue siguen reflejando fielmente el estado actual del producto tras las features de cómputo real y lado cliente,
+para que el usuario pueda publicar en Vercel/Railway siguiendo `DEPLOY.md` sin pasos desactualizados ni sorpresas.
+
+**Criterios de aceptación (verificación, no desarrollo nuevo):**
+
+1. **Checklist de rutas actualizado:** El checklist final de `DEPLOY.md` incluye todas las rutas de la aplicación vigentes, incluyendo las añadidas por las features de cómputo (`/jobs/*`) y lado cliente (`/cliente/*`), no solo las del MVP original.
+
+2. **Variables de entorno completas:** La lista de variables de entorno de Railway en `DEPLOY.md` sigue incluyendo todas las necesarias para el funcionamiento actual del backend, en particular `SUPABASE_DB_URL`, con indicación visible de qué falla si se omite.
+
+3. **Migraciones listadas en orden:** El checklist de despliegue lista explícitamente todas las migraciones necesarias (001 a 005) en el orden correcto de ejecución.
+
+4. **Sin bloqueantes de producto:** Ningún requisito funcional o no funcional de `docs/02-requisitos.md` impide la publicación del producto tal como está definido (MVP + ampliaciones).
+
+5. **Confirmación explícita registrada:** Product Owner y Architect dejan constancia de que no hay nada bloqueante para publicar o, si lo hubiera, documentan el hallazgo concreto encontrado.
+
+**Nota del Product Owner:** desde el punto de vista de requisitos de producto, no hay ningún requisito funcional o no funcional pendiente que bloquee la publicación en Vercel/Railway. Las exclusiones de alcance ya declaradas (pagos reales, WebSockets, apps móviles, panel de administración, etc.) siguen vigentes desde el MVP original y no son condición de publicación.

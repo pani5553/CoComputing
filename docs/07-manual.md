@@ -139,6 +139,10 @@ Tipos de transaccion:
 
 La solicitud queda registrada con estado "pendiente". El equipo de Co-Computing la procesara y enviara el pago al destino indicado. El monto se deduce inmediatamente del saldo disponible.
 
+### Anadir creditos (proximamente)
+
+Junto a "Retirar fondos" hay un boton "Anadir creditos". Por ahora solo muestra un aviso informativo: la compra de creditos con tarjeta o PayPal todavia no esta disponible. Mientras tanto, el saldo solo se incrementa completando tareas o chunks del pipeline distribuido.
+
 ---
 
 ## Perfil

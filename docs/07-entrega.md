@@ -221,3 +221,65 @@ Los blockers marcados como CRITICO y los R2-A-06 / R2-M-05 son bloqueantes: la f
 |---------|-------------|
 | `README.md` | Seccion "Computo Real Distribuido (feature v2)" anadida al README principal del repositorio |
 | `docs/07-entrega.md` | Este documento: lista de archivos, guia de prueba end-to-end, limitaciones, decisiones de diseno y proximos pasos |
+
+---
+
+# Co-Computing — Resumen de Entrega: Publicacion Vercel/Railway + Boton "Anadir creditos"
+
+**Fecha:** 2026-07-06
+**Autor:** Technical Writer
+**Version del producto:** 1.1.0 (sin incremento de version — ciclo de retoques puntuales, no una feature nueva)
+**Referencia:** `briefs/05-vercel-creditos.md`, `docs/05-review.md` (seccion fechada 2026-07-06), `docs/06-security.md` (seccion fechada 2026-07-06)
+
+---
+
+## Que se entrego
+
+Este ciclo era, por diseno, pequeno: dos retoques puntuales sobre un proyecto que ya funciona en local y ya tenia documentacion de despliegue completa (no una feature nueva, ver `briefs/05-vercel-creditos.md`).
+
+**Frontend:**
+
+- Boton **"Anadir creditos"** en la cartera del proveedor (`frontend/src/pages/WalletPage.tsx`), junto a "Solicitar retiro". Abre un `Modal` (componente reutilizado) con el mensaje "Muy pronto podras comprar creditos (CC) con tarjeta o PayPal. Esta funcion esta en construccion." Es un placeholder puramente visual: un unico `useState<boolean>` nuevo, sin llamada a API, sin endpoint nuevo y sin tocar el flujo de recarga ya funcional del lado cliente (`frontend/src/pages/client/DepositPage.tsx`, `POST /wallet/deposit`).
+- Confirmado que `npm run build` compila sin errores en todas las pantallas existentes (dashboard, tareas, computo, cliente).
+
+**Verificacion de preparacion para desplegar (sin cambios de arquitectura):**
+
+- DevOps repaso `DEPLOY.md` y `frontend/vercel.json` contra el estado actual del codigo y actualizo el checklist final con las rutas nuevas a probar (`/cliente/*`, `/jobs/*`), ademas de anadir una nota de riesgo sobre el hallazgo critico descrito abajo.
+- Backend Dev confirmo que `ENVIRONMENT=production` sigue desactivando `/docs`/`/redoc` y que CORS no tiene nada hardcodeado a `localhost` en el camino de produccion.
+- QA verifico manualmente el boton (abre y cierra el modal sin romper el resto de la pantalla) y que el build de frontend y la imagen Docker del backend construyen sin errores. No se anadieron tests automaticos nuevos (no hacian falta segun el encargo).
+- Product Owner, Architect, Database Engineer y Security confirmaron, cada uno desde su angulo, que no hay nada bloqueante para publicar: los requisitos y la arquitectura no tienen huecos, las 5 migraciones (`001` a `005`) estan listadas correctamente en el checklist de despliegue de `DEPLOY.md`, y `docs/06-security.md` sigue vigente.
+
+## Como probar lo nuevo
+
+1. Arrancar el frontend (`cd frontend && npm run dev`) e iniciar sesion como proveedor.
+2. Ir a "Cartera". Junto a "Solicitar retiro" debe aparecer el boton "Anadir creditos".
+3. Pulsarlo: se abre un modal con el aviso de funcion en construccion. Cerrarlo (boton "Entendido" o cerrar el modal) no deja ningun efecto secundario ni dispara llamadas de red (comprobable en la pestana de red del navegador).
+4. Confirmar que el resto de la pantalla de cartera (saldos, historial de transacciones, retiro de fondos) sigue funcionando exactamente igual que antes.
+5. Opcional: `cd frontend && npm run build` para confirmar que la build de produccion sigue compilando sin errores.
+
+## Hallazgo critico pendiente — NO resuelto en este ciclo
+
+Durante la verificacion de este ciclo, el Code Reviewer y el Security Auditor encontraron —de forma independiente el primero y confirmando/ampliando el segundo, ambos con reproduccion propia, no solo lectura— un problema **ajeno a este brief** pero presente sin commitear en el mismo arbol de trabajo: una migracion a medias del acceso a datos, de psycopg2 directo a la API REST de Supabase. Concretamente:
+
+- `backend/app/db/supabase_client.py` (fichero nuevo, sin trackear en git) construye el cliente Supabase en tiempo de import usando `os.getenv` crudo. Si las credenciales solo estan en `.env` (el flujo normal que describe este mismo README) y nadie las ha exportado como variables de entorno reales del proceso, el import de `app.main` falla con `SupabaseException: supabase_url is required`. Como `conftest.py` importa `app.main` a nivel de modulo, esto **rompe la recoleccion de los 71 tests del backend al completo**, no solo algunos.
+- `backend/app/core/config.py`: el campo `supabase_db_url` paso de obligatorio a opcional (`Optional[str] = None`), eliminando el fail-fast de arranque para todo el codigo que sigue dependiendo de psycopg2 directo — escrow del cliente, jobs de computo real y, segun amplio el Security Auditor, tambien el pago de recompensas a proveedores (`wallet_queries.py`).
+- `backend/app/db/queries/task_queries.py`: modificado como parte del mismo WIP, con manejo de errores que oculta fallos de infraestructura como si fueran resultados de negocio normales.
+
+Esto **no es una regresion introducida por el brief de este ciclo** — ni el brief 04 (despliegue) ni el 05 (Vercel/creditos) pidieron esta migracion — pero convive sin commitear en el mismo arbol de trabajo y bloquea cualquier `pytest` o arranque local que no tenga las variables de entorno exportadas manualmente.
+
+**Esta documentado en detalle, con reproduccion independiente por dos roles distintos, en:**
+
+- `docs/05-review.md`, seccion fechada 2026-07-06 ("Revision — Publicacion Vercel + Boton 'Anadir creditos'"): hallazgos R3-CRIT-01 y R3-CRIT-02 (los dos criticos), mas R3-MAYOR-01 y R3-MAYOR-02 sobre la causa raiz.
+- `docs/06-security.md`, seccion fechada 2026-07-06 ("Auditoria — Publicacion Vercel + Boton 'Anadir creditos'"): hallazgos SEC-33 a SEC-35, que confirman que no hay fuga de credenciales pero si deuda de higiene de logging/secretos, y que el radio de impacto alcanza tambien el pago a proveedores.
+- Una nota de riesgo equivalente, mas breve, en `DEPLOY.md`, seccion "5 · Checklist final antes de publicar".
+
+**La decision de revertir este WIP o completarlo queda pendiente del usuario o del equipo humano.** Ambos documentos plantean dos opciones concretas: (A) revertir `backend/app/core/config.py` y `backend/app/db/queries/task_queries.py` a `git HEAD` y borrar `backend/app/db/supabase_client.py`; o (B) conservar la migracion a REST pero corrigiendo antes los hallazgos criticos. Ninguna de las dos se ha aplicado todavia. **Este WIP no debe considerarse listo para produccion ni desplegarse tal cual** hasta que se tome esa decision.
+
+La parte que si es responsabilidad de este brief —el boton placeholder y la verificacion de despliegue— esta completa y sin hallazgos de fondo, confirmado de forma independiente por el Code Reviewer (lectura completa + `npm run build` real) y el Security Auditor (grep de secretos + lectura linea a linea).
+
+## Documentacion entregada en este ciclo
+
+| Fichero | Descripcion |
+|---------|-------------|
+| `README.md` | Nota sobre el placeholder "Anadir creditos" en una nueva seccion "Placeholders conocidos"; corregido el checklist de migraciones desactualizado (ahora referencia `DEPLOY.md` como fuente unica en vez de listar solo 001→002) |
+| `docs/07-entrega.md` | Esta entrada |

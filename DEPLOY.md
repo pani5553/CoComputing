@@ -146,11 +146,23 @@ Ejecuta **solo estas migraciones** en el SQL Editor de Supabase (nunca `003_seed
 
 ## 5 · Checklist final antes de publicar
 
+> **Nota de fiabilidad (2026-07-06):** Code Reviewer y Security Auditor detectaron un WIP sin
+> commitear en `backend/`, ajeno a cualquier brief activo (migración a medias de psycopg2 →
+> Supabase REST: `backend/app/core/config.py`, `backend/app/db/queries/task_queries.py` y el
+> fichero nuevo `backend/app/db/supabase_client.py`). Tal cual está, rompe el import de
+> `app.main` y colapsa los 71 tests (detalle completo en `docs/05-review.md` y
+> `docs/06-security.md`, secciones fechadas 2026-07-06). Corregirlo no es parte de este
+> encargo, pero antes de publicar confirma que ese cambio no viaja sin querer al build:
+> arranca el backend en local con Docker y revisa los logs.
+
+- [ ] `docker compose up -d backend` levanta el contenedor sin errores y `docker compose logs backend` no muestra `SupabaseException` ni tracebacks de import al arrancar
 - [ ] `GET https://<backend>/health` devuelve `{"status":"ok"}` (sin campo `environment`)
 - [ ] `GET https://<backend>/docs` devuelve 404
 - [ ] La landing (`https://<frontend>/`) carga sin errores
 - [ ] El registro (`/registro`) y login (`/login`) funcionan contra el backend de prod
 - [ ] El dashboard (`/dashboard`) carga correctamente tras el login
+- [ ] El flujo de cliente (`/cliente/publicar`, `/cliente/mis-tareas`, `/cliente/recargar`) funciona contra el backend de prod
+- [ ] El flujo de cómputo (`/jobs`, `/jobs/new`, `/jobs/:id`) funciona contra el backend de prod
 - [ ] Las llamadas API del frontend tienen `Access-Control-Allow-Origin` correcto (sin `*`)
 - [ ] `SUPABASE_SERVICE_ROLE_KEY` **no** aparece en los logs de Railway ni en el bundle de Vercel
 
