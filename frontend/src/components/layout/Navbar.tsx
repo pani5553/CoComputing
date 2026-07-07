@@ -25,7 +25,12 @@ export default function Navbar() {
   const navLinks = [
     { to: '/dashboard', label: 'Inicio', icon: HomeIcon },
     { to: '/tareas', label: 'Tareas', icon: BriefcaseIcon },
-    { to: '/jobs', label: 'Mis trabajos', icon: CpuChipIcon },
+    {
+      to: '/jobs',
+      label: 'Cómputo',
+      icon: CpuChipIcon,
+      title: 'Cómputo distribuido: sube tus propios datos (CSV) y procésalos entre varios proveedores',
+    },
     { to: '/cliente/mis-tareas', label: 'Publicar', icon: PlusCircleIcon },
     { to: '/cartera', label: 'Cartera', icon: WalletIcon },
     { to: '/perfil', label: 'Perfil', icon: UserIcon },
@@ -46,10 +51,11 @@ export default function Navbar() {
 
           {/* Nav desktop */}
           <div className="hidden md:flex items-center gap-1">
-            {navLinks.map(({ to, label }) => (
+            {navLinks.map(({ to, label, title }) => (
               <NavLink
                 key={to}
                 to={to}
+                title={title}
                 className={({ isActive }) =>
                   clsx(
                     'px-4 py-2 rounded-lg text-sm font-medium transition-all duration-150',
@@ -144,10 +150,11 @@ export default function Navbar() {
 
           {/* Links */}
           <div className="px-3 py-2 space-y-1">
-            {navLinks.map(({ to, label, icon: Icon }) => (
+            {navLinks.map(({ to, label, icon: Icon, title }) => (
               <NavLink
                 key={to}
                 to={to}
+                title={title}
                 onClick={() => setMobileOpen(false)}
                 className={({ isActive }) =>
                   clsx(

@@ -10,7 +10,7 @@ import {
 } from '@heroicons/react/24/outline'
 import { getWallet, getTransactions, withdraw } from '../api/wallet'
 import { extractErrorMessage } from '../api/client'
-import type { Wallet, Transaction, WithdrawMethod } from '../types'
+import type { Wallet, Transaction, TransactionType, WithdrawMethod } from '../types'
 import { SkeletonStat, SkeletonRow } from '../components/ui/SkeletonCard'
 import ErrorAlert from '../components/ui/ErrorAlert'
 import Button from '../components/ui/Button'
@@ -24,6 +24,19 @@ import {
 import { formatCC, formatDateTime } from '../utils/format'
 
 const PAGE_SIZE = 10
+
+// Tipos de transacción que representan un ingreso (saldo entrante) para el proveedor.
+// El backend siempre guarda `amount` como magnitud positiva (ver wallet_service.py /
+// client_service.py): el signo +/- es puramente de presentación aquí. Mantener en sync
+// con `TransactionType` (types/index.ts) y `txTypeConfig` (components/ui/Badge.tsx) —
+// cualquier tipo nuevo debe añadirse explícitamente a una de las dos categorías.
+const INCOME_TX_TYPES: readonly TransactionType[] = [
+  'pago_tarea', // cobro por tarea completada
+  'bonus', // bono
+  'deposito', // recarga de saldo
+  'reembolso', // devolución de escrow no usado
+  'pago_recibido', // cobro recibido
+]
 
 export default function WalletPage() {
   const navigate = useNavigate()
@@ -319,7 +332,7 @@ export default function WalletPage() {
                 </thead>
                 <tbody>
                   {transactions.map((tx) => {
-                    const isIncome = tx.tx_type === 'pago_tarea' || tx.tx_type === 'bonus'
+                    const isIncome = INCOME_TX_TYPES.includes(tx.tx_type)
                     return (
                       <tr
                         key={tx.id}
