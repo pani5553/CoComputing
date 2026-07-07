@@ -6,7 +6,6 @@ from typing import Any
 from datetime import datetime
 
 from app.db.client import get_supabase
-from app.db.supabase_client import supabase
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -71,30 +70,26 @@ def decrement_slots_atomic(task_id: str) -> bool:
     
     Returns True if a slot was successfully claimed, False if no slots remain.
     """
-    try:
-        # Get current task state
-        response = get_supabase().table("tasks").select("slots_left").eq("id", task_id).limit(1).execute()
-        if not response.data:
-            return False
-        
-        current_slots = response.data[0]["slots_left"]
-        
-        # If no slots left, return False
-        if current_slots <= 0:
-            return False
-        
-        # Try to update - decrement by 1
-        # Using eq() for slots_left ensures only one client succeeds if multiple try simultaneously
-        update_response = get_supabase().table("tasks").update({
-            "slots_left": current_slots - 1,
-            "updated_at": datetime.utcnow().isoformat() + "Z"
-        }).eq("id", task_id).eq("slots_left", current_slots).execute()
-        
-        # If update succeeded (data is not empty), we got the slot
-        return bool(update_response.data)
-    except Exception as e:
-        print(f"Error decrementing slots: {e}")
+    # Get current task state
+    response = get_supabase().table("tasks").select("slots_left").eq("id", task_id).limit(1).execute()
+    if not response.data:
         return False
+
+    current_slots = response.data[0]["slots_left"]
+
+    # If no slots left, return False
+    if current_slots <= 0:
+        return False
+
+    # Try to update - decrement by 1
+    # Using eq() for slots_left ensures only one client succeeds if multiple try simultaneously
+    update_response = get_supabase().table("tasks").update({
+        "slots_left": current_slots - 1,
+        "updated_at": datetime.utcnow().isoformat() + "Z"
+    }).eq("id", task_id).eq("slots_left", current_slots).execute()
+
+    # If update succeeded (data is not empty), we got the slot
+    return bool(update_response.data)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -146,32 +141,28 @@ def get_provider_assignments_history(provider_id: str) -> list[dict[str, Any]]:
     ordered by created_at DESC.
     Uses Supabase REST API.
     """
-    try:
-        response = supabase.table("task_assignments").select(
-            "id, task_id, status, reward_paid, trust_delta, accepted_at, started_at, completed_at, tasks(title, task_type)"
-        ).eq("provider_id", provider_id).order("created_at", desc=True).execute()
-        
-        # Flatten the nested task data
-        result = []
-        for row in response.data:
-            flattened = {
-                "id": row["id"],
-                "task_id": row["task_id"],
-                "task_title": row["tasks"]["title"] if row.get("tasks") else None,
-                "task_type": row["tasks"]["task_type"] if row.get("tasks") else None,
-                "status": row["status"],
-                "reward_paid": row["reward_paid"],
-                "trust_delta": row["trust_delta"],
-                "accepted_at": row["accepted_at"],
-                "started_at": row["started_at"],
-                "completed_at": row["completed_at"]
-            }
-            result.append(flattened)
-        
-        return result
-    except Exception as e:
-        print(f"Error fetching provider history: {e}")
-        return []
+    response = get_supabase().table("task_assignments").select(
+        "id, task_id, status, reward_paid, trust_delta, accepted_at, started_at, completed_at, tasks(title, task_type)"
+    ).eq("provider_id", provider_id).order("created_at", desc=True).execute()
+
+    # Flatten the nested task data
+    result = []
+    for row in response.data:
+        flattened = {
+            "id": row["id"],
+            "task_id": row["task_id"],
+            "task_title": row["tasks"]["title"] if row.get("tasks") else None,
+            "task_type": row["tasks"]["task_type"] if row.get("tasks") else None,
+            "status": row["status"],
+            "reward_paid": row["reward_paid"],
+            "trust_delta": row["trust_delta"],
+            "accepted_at": row["accepted_at"],
+            "started_at": row["started_at"],
+            "completed_at": row["completed_at"]
+        }
+        result.append(flattened)
+
+    return result
 
 
 def create_assignment(task_id: str, provider_id: str) -> dict[str, Any]:
@@ -231,33 +222,29 @@ def get_assignment_with_task(assignment_id: str) -> dict[str, Any] | None:
     Used by the progress endpoint. Returns None if not found.
     Uses Supabase REST API with foreign key join.
     """
-    try:
-        response = (
-            get_supabase().table("task_assignments")
-            .select("id, task_id, status, started_at, completed_at, provider_id, tasks(title, stages, duration_max)")
-            .eq("id", assignment_id)
-            .limit(1)
-            .execute()
-        )
-        
-        if not response.data:
-            return None
-        
-        row = response.data[0]
-        task_data = row.get("tasks", {}) or {}
-        
-        # Flatten the structure
-        return {
-            "assignment_id": row["id"],
-            "task_id": row["task_id"],
-            "task_title": task_data.get("title"),
-            "status": row["status"],
-            "started_at": row["started_at"],
-            "completed_at": row["completed_at"],
-            "provider_id": row["provider_id"],
-            "stages": task_data.get("stages"),
-            "duration_max": task_data.get("duration_max")
-        }
-    except Exception as e:
-        print(f"Error fetching assignment with task: {e}")
+    response = (
+        get_supabase().table("task_assignments")
+        .select("id, task_id, status, started_at, completed_at, provider_id, tasks(title, stages, duration_max)")
+        .eq("id", assignment_id)
+        .limit(1)
+        .execute()
+    )
+
+    if not response.data:
         return None
+
+    row = response.data[0]
+    task_data = row.get("tasks", {}) or {}
+
+    # Flatten the structure
+    return {
+        "assignment_id": row["id"],
+        "task_id": row["task_id"],
+        "task_title": task_data.get("title"),
+        "status": row["status"],
+        "started_at": row["started_at"],
+        "completed_at": row["completed_at"],
+        "provider_id": row["provider_id"],
+        "stages": task_data.get("stages"),
+        "duration_max": task_data.get("duration_max")
+    }

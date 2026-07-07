@@ -1,13 +1,12 @@
 from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import Optional
 
 
 class Settings(BaseSettings):
     # Supabase
     supabase_url: str
     supabase_service_role_key: str
-    supabase_db_url: Optional[str] = None
+    supabase_db_url: str
 
     # JWT
     jwt_secret_key: str

@@ -8,6 +8,7 @@ import LoginPage from './pages/LoginPage'
 import RegisterPage from './pages/RegisterPage'
 import DashboardPage from './pages/DashboardPage'
 import TaskListPage from './pages/TaskListPage'
+import TaskHistoryPage from './pages/TaskHistoryPage'
 import TaskDetailPage from './pages/TaskDetailPage'
 import ProcessingPage from './pages/ProcessingPage'
 import WalletPage from './pages/WalletPage'
@@ -51,6 +52,7 @@ export default function App() {
           <Route element={<Layout />}>
             <Route path="/dashboard" element={<DashboardPage />} />
             <Route path="/tareas" element={<TaskListPage />} />
+            <Route path="/tareas/historial" element={<TaskHistoryPage />} />
             <Route path="/tareas/:id" element={<TaskDetailPage />} />
             <Route path="/procesando/:assignmentId" element={<ProcessingPage />} />
             <Route path="/cartera" element={<WalletPage />} />

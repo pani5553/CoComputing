@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, Link } from 'react-router-dom'
 import {
   FunnelIcon,
   ClockIcon,
@@ -108,13 +108,21 @@ export default function TaskListPage() {
   return (
     <div className="animate-fade-in space-y-6">
       {/* Cabecera */}
-      <div>
-        <h1 className="text-2xl font-bold text-neutral-100">Tareas disponibles</h1>
-        {!loading && !error && (
-          <p className="text-sm text-neutral-500 mt-1">
-            {count === 0 ? 'Sin resultados' : `${count} ${count === 1 ? 'tarea encontrada' : 'tareas encontradas'}`}
-          </p>
-        )}
+      <div className="flex items-start justify-between flex-wrap gap-3">
+        <div>
+          <h1 className="text-2xl font-bold text-neutral-100">Tareas disponibles</h1>
+          {!loading && !error && (
+            <p className="text-sm text-neutral-500 mt-1">
+              {count === 0 ? 'Sin resultados' : `${count} ${count === 1 ? 'tarea encontrada' : 'tareas encontradas'}`}
+            </p>
+          )}
+        </div>
+        <Link
+          to="/tareas/historial"
+          className="inline-flex items-center gap-1 text-sm text-brand-400 hover:text-brand-300 font-medium underline-offset-2 hover:underline transition-colors"
+        >
+          ¿Buscas tus tareas ya procesadas? Ver mi historial →
+        </Link>
       </div>
 
       {/* Panel de filtros */}

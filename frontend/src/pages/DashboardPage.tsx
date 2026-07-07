@@ -278,12 +278,18 @@ export default function DashboardPage() {
               </table>
             </div>
 
-            <div className="mt-4">
+            <div className="mt-4 flex flex-wrap items-center gap-x-6 gap-y-2">
               <Link
-                to="/tareas"
+                to="/tareas/historial"
                 className="inline-flex items-center gap-1 text-brand-400 hover:text-brand-300 text-sm font-medium underline-offset-2 hover:underline transition-colors"
               >
-                Explorar todas las tareas disponibles →
+                Ver historial completo →
+              </Link>
+              <Link
+                to="/tareas"
+                className="inline-flex items-center gap-1 text-neutral-400 hover:text-neutral-200 text-sm font-medium underline-offset-2 hover:underline transition-colors"
+              >
+                Explorar tareas nuevas →
               </Link>
             </div>
           </>
