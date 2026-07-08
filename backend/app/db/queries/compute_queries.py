@@ -163,75 +163,150 @@ def create_chunks(job_id: str, payloads: list[dict[str, Any]]) -> list[dict[str,
 
 
 MAX_CHUNK_ATTEMPTS = 5
+CHUNK_ASSIGNMENT_TTL_MINUTES = 10  # ver docs/04-arquitectura.md §14.2.1
 
 
-def claim_chunks_atomic(provider_id: str, max_chunks: int) -> list[dict[str, Any]]:
+def claim_chunks_atomic(provider_id: str, max_chunks: int) -> tuple[list[dict[str, Any]], list[str]]:
     """
     Claim up to max_chunks pending chunks for provider_id in a single atomic
-    transaction using FOR UPDATE SKIP LOCKED. Two concurrent workers will never
-    claim the same chunk.
+    transaction (one psycopg2 connection, one commit), running three
+    sequential statements in order — see docs/04-arquitectura.md §14.2.4 for
+    the full rationale (why these can't be fused into a single WITH):
 
-    Chunks with attempts >= MAX_CHUNK_ATTEMPTS are rejected before claiming to
-    avoid infinite retry loops (US-38 CA-8).
-    A chunk is eligible only when the provider has not yet delivered a result for it.
-    Returns a list of dicts with keys: chunk_id, job_id, chunk_index, payload,
-    replicas_needed, job_type.
-    """
-    sql = """
-        WITH overdue AS (
-            SELECT id FROM chunks
-            WHERE status = 'pending' AND attempts >= %(max_attempts)s
-            FOR UPDATE SKIP LOCKED
-        ),
-        _reject AS (
-            UPDATE chunks SET status = 'rejected'
-            FROM overdue WHERE chunks.id = overdue.id
-        ),
-        candidates AS (
-            SELECT c.id
-            FROM chunks c
-            WHERE c.status = 'pending'
-              AND c.attempts < %(max_attempts)s
-              AND NOT EXISTS (
-                  SELECT 1 FROM chunk_results cr
-                  WHERE cr.chunk_id = c.id
-                    AND cr.provider_id = %(provider_id)s
-              )
-            ORDER BY c.created_at ASC
-            LIMIT %(max_chunks)s
-            FOR UPDATE SKIP LOCKED
-        )
-        UPDATE chunks
-        SET status      = 'assigned',
-            assigned_to = %(provider_id)s,
-            attempts    = attempts + 1
-        FROM candidates
-        WHERE chunks.id = candidates.id
-        RETURNING
-            chunks.id          AS chunk_id,
-            chunks.job_id,
-            chunks.chunk_index,
-            chunks.payload,
-            chunks.replicas_needed
+      1. TTL reclaim: 'assigned' chunks whose assigned_at exceeded
+         CHUNK_ASSIGNMENT_TTL_MINUTES go back to 'pending' (assigned_to and
+         assigned_at cleared; attempts untouched — it was already counted
+         when assigned). The provider that was assigned (assigned_to, before
+         it is cleared) is appended to abandoned_by, unless already present
+         (SEC-36 mitigation — see migrations/007_chunk_abandon_tracking.sql).
+         Uses FOR UPDATE SKIP LOCKED (via a CTE) so this statement never
+         blocks a concurrent worker on a row already being reclaimed by
+         another connection.
+      2. Attempts rejection (pre-existing logic, now reachable in practice
+         once TTL reclaim is active): 'pending' chunks with
+         attempts >= MAX_CHUNK_ATTEMPTS move to 'rejected'.
+      3. The claim itself, excluding chunks with attempts >= MAX_CHUNK_ATTEMPTS
+         and chunks the requesting provider previously abandoned (SEC-36),
+         using FOR UPDATE SKIP LOCKED so concurrent workers never claim the
+         same chunk, setting assigned_at = now().
+
+    A chunk is eligible for claim only when the provider has not yet
+    delivered a result for it AND has not previously abandoned it (left it
+    to expire via TTL without submitting) — see SEC-36 in docs/06-security.md.
+    The provider can still claim any other pending chunk normally.
+
+    Returns (claimed_chunks, rejected_job_ids):
+      - claimed_chunks: list of dicts with keys chunk_id, job_id, chunk_index,
+        payload, replicas_needed, job_type.
+      - rejected_job_ids: job_ids that had at least one chunk rejected for
+        exceeding MAX_CHUNK_ATTEMPTS during this call, so the service layer
+        can attempt to close them (see consensus_service.process_chunk_claim).
     """
     with psycopg2.connect(
         settings.supabase_db_url,
         cursor_factory=psycopg2.extras.RealDictCursor,
     ) as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, {
-                "provider_id": provider_id,
-                "max_chunks": max_chunks,
-                "max_attempts": MAX_CHUNK_ATTEMPTS,
-            })
-            rows = cur.fetchall()
+            # 1. TTL RECLAIM — return expired 'assigned' chunks to 'pending',
+            #    recording the abandoning provider in abandoned_by (SEC-36).
+            cur.execute(
+                """
+                WITH expired AS (
+                    SELECT id FROM chunks
+                    WHERE status = 'assigned'
+                      AND assigned_at < now() - make_interval(mins => %(ttl_minutes)s)
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE chunks
+                SET status = 'pending',
+                    assigned_to = NULL,
+                    assigned_at = NULL,
+                    abandoned_by = CASE
+                        WHEN chunks.assigned_to = ANY(chunks.abandoned_by) THEN chunks.abandoned_by
+                        ELSE chunks.abandoned_by || chunks.assigned_to
+                    END
+                FROM expired
+                WHERE chunks.id = expired.id
+                RETURNING chunks.id AS chunk_id, chunks.job_id AS job_id, chunks.attempts AS attempts
+                """,
+                {"ttl_minutes": CHUNK_ASSIGNMENT_TTL_MINUTES},
+            )
+            reclaimed = cur.fetchall()
+            if reclaimed:
+                logger.warning(
+                    "TTL de asignación superado (%d min): %d chunk(s) devueltos a pending: %s",
+                    CHUNK_ASSIGNMENT_TTL_MINUTES,
+                    len(reclaimed),
+                    [str(r["chunk_id"]) for r in reclaimed],
+                )
+
+            # 2. ATTEMPTS REJECTION — pre-existing logic, now reachable via TTL reclaim.
+            cur.execute(
+                """
+                WITH overdue AS (
+                    SELECT id FROM chunks
+                    WHERE status = 'pending' AND attempts >= %(max_attempts)s
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE chunks SET status = 'rejected'
+                FROM overdue
+                WHERE chunks.id = overdue.id
+                RETURNING chunks.id AS chunk_id, chunks.job_id AS job_id
+                """,
+                {"max_attempts": MAX_CHUNK_ATTEMPTS},
+            )
+            rejected = cur.fetchall()
+
+            # 3. CLAIM — existing logic, plus assigned_at = now().
+            cur.execute(
+                """
+                WITH candidates AS (
+                    SELECT c.id
+                    FROM chunks c
+                    WHERE c.status = 'pending'
+                      AND c.attempts < %(max_attempts)s
+                      AND NOT (%(provider_id)s = ANY(c.abandoned_by))
+                      AND NOT EXISTS (
+                          SELECT 1 FROM chunk_results cr
+                          WHERE cr.chunk_id = c.id
+                            AND cr.provider_id = %(provider_id)s
+                      )
+                    ORDER BY c.created_at ASC
+                    LIMIT %(max_chunks)s
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE chunks
+                SET status      = 'assigned',
+                    assigned_to = %(provider_id)s,
+                    assigned_at = now(),
+                    attempts    = attempts + 1
+                FROM candidates
+                WHERE chunks.id = candidates.id
+                RETURNING
+                    chunks.id          AS chunk_id,
+                    chunks.job_id,
+                    chunks.chunk_index,
+                    chunks.payload,
+                    chunks.replicas_needed
+                """,
+                {
+                    "provider_id": provider_id,
+                    "max_chunks": max_chunks,
+                    "max_attempts": MAX_CHUNK_ATTEMPTS,
+                },
+            )
+            claimed = cur.fetchall()
+
             conn.commit()
 
-    # Enrich each chunk row with job_type from the jobs table via a single query
-    if not rows:
-        return []
+    rejected_job_ids = list({str(r["job_id"]) for r in rejected})
 
-    chunk_rows = [dict(r) for r in rows]
+    # Enrich each claimed chunk row with job_type from the jobs table via a
+    # single query.
+    if not claimed:
+        return [], rejected_job_ids
+
+    chunk_rows = [dict(r) for r in claimed]
     job_ids = list({r["job_id"] for r in chunk_rows})
 
     # Fetch job_types for all referenced jobs
@@ -246,7 +321,7 @@ def claim_chunks_atomic(provider_id: str, max_chunks: int) -> list[dict[str, Any
     for row in chunk_rows:
         row["job_type"] = job_type_map.get(str(row["job_id"]), "data-processing")
 
-    return chunk_rows
+    return chunk_rows, rejected_job_ids
 
 
 def get_chunk(chunk_id: str) -> dict[str, Any] | None:
@@ -269,13 +344,22 @@ def update_chunk_status(
     status: str,
     assigned_to: str | None = None,
 ) -> dict[str, Any]:
-    """Update chunk status (and optionally assigned_to). Returns updated row."""
+    """
+    Update chunk status (and optionally assigned_to). Returns updated row.
+
+    Invariant (docs/04-arquitectura.md §14.2.2): assigned_at is NOT NULL iff
+    status == 'assigned'. assigned_at is only ever set to now() by
+    claim_chunks_atomic's own claim statement — any transition made here to a
+    status other than 'assigned' must clear it.
+    """
     payload: dict[str, Any] = {"status": status}
     if assigned_to is not None:
         payload["assigned_to"] = assigned_to
     elif status == "pending":
         # Reset assigned_to to null when returning to queue
         payload["assigned_to"] = None
+    if status != "assigned":
+        payload["assigned_at"] = None
     response = (
         get_supabase().table("chunks")
         .update(payload)

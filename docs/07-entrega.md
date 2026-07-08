@@ -148,11 +148,11 @@ La pagina de resultado muestra los valores calculados por columna. El boton "Des
 | Limitacion | Descripcion |
 |------------|-------------|
 | Sin sandboxing del worker | El worker ejecuta polars sobre payloads de la API sin aislamiento. Solo usar en entornos de confianza. Ver nota de seguridad en el README. |
-| Sin timeout de chunks asignados | Si un worker reclama un chunk y desaparece, el chunk queda en estado `assigned` indefinidamente. No hay TTL ni scheduler que lo devuelva a `pending`. El job queda atascado. Workaround manual: actualizar el estado directamente en Supabase. |
+| ~~Sin timeout de chunks asignados~~ | **RESUELTO 2026-07-07.** TTL de 10 minutos vía reclamo perezoso en `POST /work/claim` (`migrations/006_chunk_ttl.sql`) + rechazo automatico tras 5 intentos, ya activo. Ver "Proximos pasos sugeridos para v3" (puntos 1 y 3) y `docs/04-arquitectura.md` §14.2. La migracion no hizo backfill automatico, pero se comprobo manualmente contra produccion el 2026-07-08 y no habia ningun chunk `assigned` preexistente que necesitara limpieza (ver entrada de cierre de ciclo 2026-07-08). |
 | Sin rate limiting en `/work/claim` | Un proveedor autenticado puede reclamar chunks de forma agresiva sin limitacion. No hay proteccion contra acaparamiento de trabajo. |
 | Credenciales del worker en linea de comandos | El argumento `--password` expone la contrasena en el historial de shell y en `ps aux`. En produccion, usar variables de entorno o un gestor de secretos. |
 | Sin deteccion de ataques Sybil | Un mismo operador puede registrar multiples cuentas y procesar el mismo chunk dos veces, garantizando consenso artificialmente. La unica proteccion es `UNIQUE (chunk_id, provider_id)` que bloquea el doble submit con la misma cuenta. |
-| Operaciones de wallet no completamente atomicas | `credit_reward` hereda el patron read-modify-write de `update_wallet_on_task_complete`. Con chunks validados de forma muy concurrente, podria perderse alguna recompensa. Fix pendiente (R2-C-02 en `docs/05-review.md`). |
+| ~~Operaciones de wallet no completamente atomicas~~ | **RESUELTO 2026-07-07**, de forma mas completa de lo pedido: `wallet_queries.credit_reward_and_update_trust` aplica pago de recompensa + actualizacion de trust score en una unica transaccion psycopg2 con `FOR UPDATE`. Ver "Proximos pasos sugeridos para v3" (punto 2) y `docs/04-arquitectura.md` §14.3. El codigo antiguo (`wallet_service.credit_reward`, no-atomico) quedo huerfano sin llamadores (V3-MAYOR-02 en `docs/05-review.md`) y ya se elimino el 2026-07-08. |
 | Tipo de job unico | Solo `data-processing` esta implementado. La arquitectura de plugin esta preparada para tipos adicionales (`transcription`, `rendering`, etc.) pero no implementados. |
 | Sin endpoint DELETE /jobs | Un job en estado `splitting` o `failed` no puede eliminarse desde la API. Debe gestionarse directamente en Supabase. |
 
@@ -176,10 +176,10 @@ La pagina de resultado muestra los valores calculados por columna. El boton "Des
 
 **Estabilidad y correccion (prioridad alta):**
 
-1. TTL para chunks asignados. Un scheduler debe devolver a `pending` los chunks con `status = assigned` que lleven mas de N minutos sin recibir submit. Valor sugerido: 10 minutos.
-2. Operacion atomica en `credit_reward`: `UPDATE wallets SET available_balance = available_balance + %s WHERE provider_id = %s RETURNING *` sin doble lectura.
-3. Rechazo automatico de chunks con mas de 5 intentos (US-38 CA-8, actualmente no implementado; ver R2-A-04 en `docs/05-review.md`).
-4. Transaccionalidad en la creacion de job + chunks para evitar jobs fantasma en estado `splitting` si falla la insercion de chunks (R2-A-05).
+1. ~~TTL para chunks asignados.~~ **RESUELTO (2026-07-07).** Implementado como "reclamo perezoso" dentro del propio `POST /work/claim` (sin scheduler externo), con TTL de 10 minutos vía la nueva columna `chunks.assigned_at` (`migrations/006_chunk_ttl.sql`, ya aplicada a produccion). Diseño en `docs/04-arquitectura.md` §14.2; revisado sin bloqueantes en `docs/05-review.md` (seccion 2026-07-07); `docs/06-security.md` marca **SEC-22 → RESUELTO** (seccion 2026-07-07). Detalle de deuda residual (falta de backfill para chunks ya atascados antes del despliegue, V3-MAYOR-01) en la entrada de cierre de ciclo mas abajo.
+2. ~~Operacion atomica en `credit_reward`.~~ **RESUELTO (2026-07-07), de forma mas completa de lo pedido.** No solo el credito de wallet quedo atomico: pago de recompensa + actualizacion de trust score ahora se ejecutan en la MISMA transaccion psycopg2 (nueva funcion `wallet_queries.credit_reward_and_update_trust`, con `SELECT ... FOR UPDATE` sobre el proveedor para evitar carreras entre chunks liquidados casi simultaneamente). Diseño en `docs/04-arquitectura.md` §14.3; `docs/06-security.md` marca **SEC-24 → RESUELTO** (seccion 2026-07-07).
+3. ~~Rechazo automatico de chunks con mas de 5 intentos~~ (US-38 CA-8; ver R2-A-04 en `docs/05-review.md`). **RESUELTO (2026-07-07).** La logica (`MAX_CHUNK_ATTEMPTS = 5`) ya existia en el codigo pero era, en la practica, casi inalcanzable sin TTL (nada devolvia un chunk de `assigned` a `pending` salvo el propio flujo de consenso). Al activar el TTL del punto 1, este mecanismo pasa a ser plenamente alcanzable en la misma llamada a `/work/claim`. Ver `docs/04-arquitectura.md` §14.0.2 y §14.2.5. Nota: esta misma activacion abrio un hallazgo de seguridad nuevo (SEC-36, ya cerrado) — ver la entrada de cierre de ciclo mas abajo.
+4. Transaccionalidad en la creacion de job + chunks para evitar jobs fantasma en estado `splitting` si falla la insercion de chunks (R2-A-05). **Sigue pendiente** — fuera del alcance del ciclo 2026-07-07/08.
 
 **Seguridad:**
 
@@ -283,3 +283,47 @@ La parte que si es responsabilidad de este brief —el boton placeholder y la ve
 |---------|-------------|
 | `README.md` | Nota sobre el placeholder "Anadir creditos" en una nueva seccion "Placeholders conocidos"; corregido el checklist de migraciones desactualizado (ahora referencia `DEPLOY.md` como fuente unica en vez de listar solo 001→002) |
 | `docs/07-entrega.md` | Esta entrada |
+
+---
+
+# Co-Computing — Cierre de ciclo: Estabilidad v3 (TTL de chunks + transaccion pago/trust) + SEC-36
+
+**Fecha:** 2026-07-08
+**Autor:** Technical Writer
+**Version del producto:** 1.1.0 (sin incremento de version — ciclo de fiabilidad interna, no una feature de producto)
+**Referencia:** `docs/04-arquitectura.md` §14, `docs/05-review.md` (secciones fechadas 2026-07-07), `docs/06-security.md` (secciones fechadas 2026-07-07 y 2026-07-08)
+
+## Que se entrego
+
+Este ciclo resolvio dos de los "Proximos pasos sugeridos para v3" identificados al cierre del ciclo anterior (ver mas arriba en este mismo documento), y en el proceso se encontro y cerro un hallazgo de seguridad nuevo.
+
+**1. TTL de chunks asignados + rechazo automatico por intentos (puntos 1 y 3 de "Proximos pasos").** Un chunk que queda `assigned` sin submit durante mas de 10 minutos se devuelve automaticamente a `pending` mediante un reclamo perezoso dentro del propio `POST /work/claim` (sin scheduler externo, sin dependencia nueva). Esto activa de verdad la logica de rechazo tras 5 intentos (`MAX_CHUNK_ATTEMPTS`), que ya existia en el codigo pero era casi inalcanzable antes de este cambio. Diseño completo en `docs/04-arquitectura.md` §14.2; verificado por el Code Reviewer (sin bloqueantes, 3 hallazgos MAYOR no bloqueantes) y por el Security Auditor (**SEC-22 → RESUELTO**).
+
+**2. Transaccion atomica de pago + trust score (punto 2 de "Proximos pasos"), resuelta de forma mas completa de lo pedido.** El encargo original pedia solo que el credito de wallet fuese atomico. Se entrego mas: la nueva funcion `wallet_queries.credit_reward_and_update_trust` aplica pago de recompensa, registro de transaccion y actualizacion de trust score (con `SELECT ... FOR UPDATE` sobre el proveedor) en una **unica** transaccion psycopg2 — todo o nada. Diseño en `docs/04-arquitectura.md` §14.3; el Security Auditor confirma **SEC-24 → RESUELTO** (ventana de carrera cerrada, verificado a nivel de esquema, no solo de codigo).
+
+**3. Migraciones nuevas — ambas ya aplicadas a produccion, no son pendientes:**
+
+| Migracion | Contenido | Estado |
+|-----------|-----------|--------|
+| `migrations/006_chunk_ttl.sql` | Añade `chunks.assigned_at timestamptz` + indice parcial `idx_chunks_assigned_at ON chunks(assigned_at) WHERE status='assigned'`. Sin backfill automatico (V3-MAYOR-01 en `docs/05-review.md`): los chunks que ya estuvieran `assigned` antes del despliegue habrian quedado con `assigned_at IS NULL`, sin ser reclamados retroactivamente por el TTL. Verificado manualmente contra produccion el 2026-07-08: 0 chunks en estado `assigned` en ese momento, por lo que no hizo falta limpieza. | Aplicada a produccion |
+| `migrations/007_chunk_abandon_tracking.sql` | Añade `chunks.abandoned_by uuid[]`, usada por `claim_chunks_atomic` para impedir que un proveedor vuelva a reclamar un chunk que el mismo abandono via TTL. Cierra SEC-36 (ver abajo). | Aplicada a produccion |
+
+**4. Hallazgo de seguridad nuevo, encontrado y cerrado en el mismo ciclo: SEC-36.** Al activar el TTL, el Security Auditor detecto (2026-07-07) que un unico proveedor — sin necesidad de multiples cuentas (Sybil) — podia forzar el rechazo permanente de cualquier chunk objetivo reclamandolo y dejandolo expirar repetidamente (cada expiracion cuenta como un intento; tras 5, el chunk se rechaza para siempre, sin ninguna penalizacion de trust score porque el camino de penalizacion solo se dispara para resultados efectivamente entregados). El Backend Dev implemento la mitigacion (exclusion de auto-reclamo via `chunks.abandoned_by`, migracion 007) y el Security Auditor la verifico de forma independiente el 2026-07-08, leyendo el codigo actual: **SEC-36 → RESUELTO** para el vector que lo hacia explotable por un actor unico.
+
+## Lo que queda explicitamente fuera de este ciclo
+
+- **SEC-23 (ataque Sybil en consenso) y SEC-21 (sin rate limiting en `/work/claim`) siguen SIN RESOLVER.** La propia verificacion de cierre de SEC-36 (`docs/06-security.md`, seccion 2026-07-08) confirma que el riesgo residual — varias cuentas repartiendose el abandono de un mismo chunk para evadir la exclusion por-proveedor que cierra SEC-36 — queda subsumido en SEC-23, no resuelto por este ciclo. Los tres hallazgos (SEC-36 cerrado, SEC-21 y SEC-23 pendientes) comparten la misma causa raiz de fondo: `/work/claim` no tiene ningun control de identidad o comportamiento por proveedor mas alla de la validez del JWT. `docs/06-security.md` recomienda explicitamente abordar SEC-21 y SEC-23 en el mismo esfuerzo de diseño, no por separado.
+- La segunda mitigacion sugerida para SEC-36 (penalizar `accuracy`/`completion_rate` cuando un proveedor abandona un chunk via TTL) **no se implemento** — abandonar un chunk sigue sin costar nada en reputacion. Queda como hardening de defensa en profundidad en el backlog, no bloqueante.
+- El punto 4 original de "Proximos pasos sugeridos para v3" (transaccionalidad en la creacion de job + chunks, R2-A-05) **sigue sin resolver** — no formaba parte del alcance de este ciclo.
+- `docs/05-review.md` señalo tres hallazgos MAYOR, los tres ya cerrados el 2026-07-08: **V3-MAYOR-01** (falta de backfill en la migracion 006) — confirmado operativamente que no hacia falta, 0 chunks `assigned` en produccion en el momento de la verificacion; **V3-MAYOR-02** (`wallet_service.credit_reward` como codigo muerto) — funcion eliminada; **V3-MAYOR-03** (la sentencia de reclamo TTL no usaba `FOR UPDATE SKIP LOCKED` como las otras dos sentencias de `claim_chunks_atomic`) — corregido, ahora las tres sentencias usan el mismo patron. Queda pendiente, eso si, un test de concurrencia real (multi-hilo/multi-proceso) que ejercite `claim_chunks_atomic` bajo carga simultanea genuina — lo existente son tests de integracion secuenciales contra una BD real, no concurrencia de verdad.
+- El patron no-transaccional de pago + trust en `task_lifecycle.py` (flujo de tareas clasicas, distinto del pipeline de computo) **no se toco** — es un problema analogo y documentado como deuda diferida para v4, no una regresion de este ciclo.
+
+## Documentacion entregada en este ciclo
+
+| Fichero | Descripcion |
+|---------|-------------|
+| `docs/04-arquitectura.md` | Seccion 14 nueva: diseño del TTL de chunks asignados y de la transaccion pago + trust |
+| `docs/05-review.md` | Revision del ciclo (seccion 2026-07-07): 0 hallazgos criticos, 3 mayores, 2 menores, 1 informativo |
+| `docs/06-security.md` | Auditoria del ciclo (seccion 2026-07-07: SEC-22 y SEC-24 resueltos, SEC-36 nuevo) y verificacion de cierre de SEC-36 (seccion 2026-07-08) |
+| `README.md` | (Sin seccion "Limitaciones conocidas del MVP" propia — esa tabla vive en este documento) sin cambios adicionales de contenido tecnico en este ciclo mas alla de los ya vigentes |
+| `docs/07-entrega.md` | Marcados como RESUELTOS los puntos 1-3 de "Proximos pasos sugeridos para v3" y las dos filas correspondientes de "Limitaciones conocidas del MVP" (mas arriba en este documento); esta entrada de cierre de ciclo |

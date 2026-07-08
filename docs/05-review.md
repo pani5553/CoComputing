@@ -1325,3 +1325,152 @@ El rewrite `{ "source": "/(.*)", "destination": "/index.html" }` es un catch-all
 4. **Confirmar explícitamente que `docs/06-security.md` sigue vigente**, tal como pide el brief 05 — no encontré ninguna constancia escrita de esta confirmación en este ciclo (ver nota de proceso arriba); sería bueno que quedase registrada, aunque sea en una línea, para mantener la trazabilidad que sí mostraron Product Owner y Architect.
 
 5. Todo lo señalado en los handoffs de seguridad de los dos ciclos anteriores (race conditions financieras, JWT en localStorage, rate limiting, RLS inactivo para JWT propio, cuenta demo, worker con credenciales en CLI, ausencia de timeout de asignación de chunks, consenso gamificable con cuentas Sybil) sigue vigente y no se ha vuelto a tocar en este ciclo — no hace falta re-auditarlo salvo que el WIP de backend descrito en la Parte A se termine fusionando, en cuyo caso recomiendo repetir específicamente el punto 5 del handoff original (verificación de aislamiento por `provider_id`/`client_id` en cada endpoint) sobre las funciones reescritas de `task_queries.py`, ya que su lógica interna cambió por completo aunque sus firmas no.
+
+---
+
+## Revisión — Estabilidad v3 (TTL de Chunks Asignados + Transacción Pago/Trust) — 2026-07-07
+
+**Revisor:** Code Reviewer Senior
+**Referencia:** `docs/07-entrega.md` ("Próximos pasos sugeridos para v3", puntos 1 y 3), diseño en `docs/04-arquitectura.md` §14
+**Escala de severidad de este ciclo:** CRÍTICO / MAYOR / MENOR
+**Alcance:** `backend/app/db/queries/compute_queries.py`, `backend/app/db/queries/wallet_queries.py`, `backend/app/services/consensus_service.py`, `backend/app/routers/work.py`, `backend/tests/test_consensus.py`, `backend/tests/test_integration_reliability_v3.py`, `migrations/006_chunk_ttl.sql`, `docs/04-arquitectura.md` §14, `docs/04-api-contracts.md`.
+
+### Método de verificación
+
+No me limité a leer el resumen de QA/Backend Dev. Leí `git diff` completo de cada fichero tocado, línea a línea, y además:
+
+- Trazé a mano las tres sentencias secuenciales de `claim_chunks_atomic` bajo escenarios de concurrencia (dos workers reclamando casi simultáneamente el mismo chunk expirado, un chunk que agota `MAX_CHUNK_ATTEMPTS` y se rechaza en la misma llamada que lo reclama, un worker que entrega tarde un resultado para un chunk ya reasignado por TTL a otro proveedor) — no solo el camino feliz que ejercita el test de integración de QA.
+- Confirmé por lectura directa (no solo por el docstring) que `credit_reward_and_update_trust` con `valid=False` nunca ejecuta las sentencias `UPDATE wallets` / `INSERT INTO transactions` — ambas están dentro del mismo bloque `if valid:` (líneas 199–213 del fichero).
+- Hice `grep` de `credit_reward`, `wallet_service`, `update_wallet_on_task_complete` y `claim_chunks_atomic` en todo `backend/` para verificar qué queda vivo y qué queda huérfano tras el cambio, en vez de asumir lo que dice `docs/04-arquitectura.md` §14.3.1 sobre quién sigue usando qué.
+- Releí `backend/app/services/task_lifecycle.py` completo para verificar si el patrón "pago y trust en pasos separados" que se corrige aquí para `consensus_service` sigue existiendo sin corregir en el flujo de tareas clásicas.
+
+### Índice de hallazgos de este ciclo
+
+| ID | Severidad | Resumen |
+|----|-----------|---------|
+| V3-MAYOR-01 | MAYOR | `migrations/006_chunk_ttl.sql` no hace backfill de `assigned_at` para chunks que ya estaban en `assigned` antes de aplicar la migración — esos chunks quedan con `assigned_at IS NULL` y el TTL nunca los reclama; no hay evidencia en este ciclo de que el `UPDATE` manual de limpieza recomendado en §14.2.3/§14.5 se haya ejecutado |
+| V3-MAYOR-02 | MAYOR | `wallet_service.credit_reward` queda como código muerto (cero llamadores en todo el proyecto) y la justificación escrita en `docs/04-arquitectura.md` §14.3.1 para no tocarlo ("sigue siendo el camino usado por `task_lifecycle.py`") es incorrecta — `task_lifecycle.py` nunca ha llamado a esa función |
+| V3-MAYOR-03 | MAYOR | La sentencia 1 (reclamo por TTL) de `claim_chunks_atomic` es un `UPDATE` sin `SKIP LOCKED`, a diferencia de las sentencias 2 y 3 — bajo `/work/claim` concurrente con chunks expirados solapados, esto serializa la transacción completa de 3 sentencias de un worker sobre otro; no hay ningún test (ni el de QA) que ejercite dos llamadas realmente concurrentes a `claim_chunks_atomic` |
+| V3-MENOR-01 | MENOR | Duplicación: el `UPDATE wallets SET available_balance = ... , total_earned = ...` está ahora copiado literalmente en `update_wallet_on_task_complete` y en `credit_reward_and_update_trust` |
+| V3-MENOR-02 | MENOR | `docs/04-api-contracts.md` deja como ejemplo principal el SQL de una sola sentencia (pre-v3, ya no representa el código real) y añade la versión v3 solo como nota de texto debajo |
+| V3-INFO-01 | INFO | Confirmado (no es hallazgo nuevo): `task_lifecycle.complete_task`/`fail_task` tienen el mismo patrón de pago+trust no transaccional que se corrigió aquí para `consensus_service`, y sigue sin corregirse — ya documentado como deuda diferida explícita en §14.3.1/§14.4, se deja constancia para que no se pierda como ítem de backlog |
+
+---
+
+### V3-MAYOR-01 — Migración sin backfill: chunks ya atascados antes del despliegue nunca serán reclamados por TTL
+
+**Archivo:** `migrations/006_chunk_ttl.sql` (completo); `backend/app/db/queries/compute_queries.py` líneas 202–214 (sentencia 1 de `claim_chunks_atomic`)
+
+**Descripción:** La migración añade `assigned_at timestamptz NULL` sin backfill (`ALTER TABLE chunks ADD COLUMN IF NOT EXISTS assigned_at timestamptz;` — ninguna sentencia posterior rellena la columna para las filas existentes). El propio `docs/04-arquitectura.md` §14.2.3 lo reconoce explícitamente: *"los chunks ya existentes en assigned [...] quedarán con assigned_at IS NULL [...] no serán reclamados automáticamente"*, y delega la limpieza a una acción manual y opcional del Database Engineer (`UPDATE chunks SET status='pending', assigned_to=NULL WHERE status='assigned'`, §14.2.3/§14.5 punto 2) que **no forma parte de ningún script versionado** — es una decisión operativa puntual, sin registro de si se ejecutó.
+
+Confirmé en el código (no solo en el diseño) que esto es exactamente cierto: la sentencia 1 de `claim_chunks_atomic` filtra con `WHERE status = 'assigned' AND assigned_at < now() - make_interval(...)`. En SQL, `NULL < cualquier_cosa` evalúa a `NULL` (falsy), nunca a `true` — un chunk con `assigned_at IS NULL` **nunca** puede cumplir esa condición, por construcción, para siempre, hasta que reciba una asignación nueva (que sí fija `assigned_at = now()`).
+
+El contexto de este ciclo indica que la migración ya se aplicó contra la base de datos real de producción (columna e índice verificados), pero no hay ninguna evidencia en los artefactos de este ciclo (ni en `docs/04-arquitectura.md`, ni en el propio test de QA) de que el `UPDATE` de limpieza puntual se haya ejecutado. Si a fecha de despliegue existían chunks ya atascados en `assigned` (el problema que esta iniciativa entera existe para resolver), esos chunks concretos **no quedan resueltos por este cambio** — seguirán atascados indefinidamente, silenciosamente, mientras que cualquier chunk asignado *a partir de ahora* sí queda protegido por el TTL. Esto puede dar una falsa sensación de "problema resuelto" cuando en realidad solo está resuelto hacia adelante.
+
+**Impacto:** Reliability — los jobs que dependían de chunks ya atascados antes del despliegue permanecen bloqueados en `processing` indefinidamente, exactamente el síntoma que esta iniciativa completa (v3, puntos 1 y 3 de "próximos pasos") se propuso eliminar.
+
+**Fix sugerido:** Confirmar con el Database Engineer, de forma explícita y por escrito, si el `UPDATE chunks SET status='pending', assigned_to=NULL WHERE status='assigned' AND assigned_at IS NULL` (limitado a `assigned_at IS NULL` para no tocar asignaciones ya cubiertas por el TTL) se ejecutó en producción al desplegar `006_chunk_ttl.sql`. Si no se ha ejecutado, ejecutarlo ahora como paso operativo separado, o añadirlo como parte de un script de mantenimiento explícito y trazable (no necesariamente dentro de la migración idempotente, pero sí documentado como "hecho" en algún sitio versionado).
+
+---
+
+### V3-MAYOR-02 — `wallet_service.credit_reward` es código muerto; la justificación documentada para conservarlo es incorrecta
+
+**Archivo:** `backend/app/services/wallet_service.py`, líneas 106–122
+**Archivo relacionado:** `docs/04-arquitectura.md` §14.3.1 ("Qué se decide NO cambiar")
+
+**Descripción:** Antes de este ciclo, `consensus_service._pay_and_update_trust` llamaba a `wallet_service.credit_reward`. Este ciclo la sustituye por `wallet_queries.credit_reward_and_update_trust` (confirmado en el diff de `consensus_service.py`: el import de `wallet_service` desaparece del módulo). Hice `grep -rn "credit_reward\b"` sobre todo `backend/` y **no queda ninguna llamada real** a `wallet_service.credit_reward` — ni en código de producción ni en tests (los tests de `test_wallet.py` no la ejercitan; solo prueban `get_wallet`, `get_transactions` y `process_withdrawal` de ese mismo módulo).
+
+`docs/04-arquitectura.md` §14.3.1 justifica no tocar esta función así: *"wallet_service.credit_reward y wallet_queries.update_wallet_on_task_complete no se modifican — siguen siendo el camino usado por task_lifecycle.py"*. Esta afirmación es correcta para `update_wallet_on_task_complete` (`task_lifecycle.py` línea 144 la llama directamente) pero **incorrecta para `wallet_service.credit_reward`**: leí `task_lifecycle.py` completo y en ningún punto importa ni llama a `wallet_service` — llama a `wallet_queries.update_wallet_on_task_complete` y `wallet_queries.create_transaction` directamente, sin pasar por `wallet_service.credit_reward`. Esa función solo tenía un llamador en todo el proyecto (`consensus_service._pay_and_update_trust`, versión pre-v3), y este ciclo se lo quitó sin darse cuenta de que la dejaba huérfana.
+
+**Impacto:** Deuda técnica menor en sí misma (una función de 17 líneas sin llamadores), pero el riesgo real es documental: un desarrollador futuro que lea §14.3.1 asumirá que `wallet_service.credit_reward` sigue en uso activo por el flujo de tareas clásicas y evitará tocarla "para no romper nada", cuando en realidad no la ejecuta nadie — o, peor, alguien podría reutilizarla pensando que es el patrón vigente para acreditar recompensas, reintroduciendo el bug de dos pasos no transaccional que esta misma iniciativa se propuso eliminar.
+
+**Fix sugerido:** Eliminar `wallet_service.credit_reward` (backend/app/services/wallet_service.py líneas 106–122) y corregir la frase de `docs/04-arquitectura.md` §14.3.1 para que diga únicamente que `wallet_queries.update_wallet_on_task_complete` sigue siendo el camino usado por `task_lifecycle.py`, sin mencionar `wallet_service.credit_reward`. Si se prefiere no tocar código en este ciclo, como mínimo corregir la frase del documento para que no induzca a error.
+
+---
+
+### V3-MAYOR-03 — Reclamo por TTL sin `SKIP LOCKED`: serializa el `/work/claim` completo bajo concurrencia real, sin test que lo verifique
+
+**Archivo:** `backend/app/db/queries/compute_queries.py`, líneas 202–222 (sentencia 1) vs. líneas 224–239 y 241–278 (sentencias 2 y 3)
+
+**Descripción:** Las sentencias 2 (rechazo por intentos) y 3 (claim) usan `FOR UPDATE SKIP LOCKED` explícitamente para que dos workers concurrentes nunca se bloqueen entre sí — es el patrón ya establecido y correcto del proyecto. La sentencia 1, nueva en este ciclo, es un `UPDATE` liso sin `SKIP LOCKED`:
+
+```sql
+UPDATE chunks
+SET status = 'pending', assigned_to = NULL, assigned_at = NULL
+WHERE status = 'assigned'
+  AND assigned_at < now() - make_interval(mins => %(ttl_minutes)s)
+```
+
+`docs/04-arquitectura.md` §14.2.4 justifica esto razonando sobre **una sola fila en disputa**: *"la segunda simplemente bloquea brevemente y al re-evaluar su WHERE tras el lock ya no encuentra la fila [...] afectando 0 filas"* — cierto para ese caso, y confirmo que no hay riesgo de doble-reclamo (la fila ya no cumple `status='assigned'` tras el commit del primero). Pero el razonamiento no cubre el efecto de segundo orden: como las 3 sentencias van en **una única transacción con un solo `conn.commit()` al final**, si el worker A bloquea en la sentencia 1 al worker B por una fila en disputa, B queda bloqueado no solo durante la sentencia 1 de A, sino durante **las sentencias 2 y 3 de A también** (A no libera el lock hasta su propio commit final). Con varios workers haciendo polling cada 5s (`backend/app/worker/main.py`) y varios chunks expirando en ventanas de tiempo parecidas (razonable si varios workers del mismo lote se caen a la vez), esto reintroduce exactamente el tipo de contención que el uso de `SKIP LOCKED` en las sentencias 2 y 3 fue diseñado para evitar — ahora concentrado en la sentencia 1.
+
+Esto no es un bug de corrección (no hay doble-claim, no hay lectura corrupta) y el propio diseño ya asume que el polling cada 5s absorbe el caso donde una fila se "salta" un ciclo. Pero es precisamente el tipo de comportamiento que solo se ve bajo carga real con múltiples workers simultáneos, y **ningún test de este ciclo lo ejercita**: el test de integración de QA (`test_ttl_reclaims_expired_assigned_chunk_and_allows_reclaim_by_other_provider`) hace una única llamada secuencial a `claim_chunks_atomic`, no dos llamadas concurrentes reales (hilos/procesos) contra la misma fila expirada.
+
+**Impacto:** Bajo condiciones de carga alta (muchos workers, muchos chunks expirados a la vez tras una caída masiva de workers), las llamadas a `/work/claim` pueden encolarse y aumentar su latencia de forma perceptible, en el peor de los casos acercándose a timeouts de request si el pool de conexiones o el timeout HTTP del cliente worker son ajustados. No bloqueante para el volumen actual del proyecto, pero es exactamente el escenario ("no solo el caso feliz") que este ciclo pidió verificar y que no está cubierto por ningún test.
+
+**Fix sugerido:** Si se quiere mantener la garantía de "mejor esfuerzo, eventualmente consistente" que ya justifica no usar `SKIP LOCKED` en las sentencias 2/3 hoy, aplicar el mismo patrón a la sentencia 1 envolviéndola en un `WITH ... FOR UPDATE SKIP LOCKED` + `UPDATE ... FROM`, aceptando que un chunk "saltado" por contención se recogerá en el siguiente poll (5s después, ya tolerado por diseño). Alternativamente, añadir un test de concurrencia real (dos hilos o dos procesos llamando a `claim_chunks_atomic` casi simultáneamente contra chunks expirados solapados) al módulo de QA `test_integration_reliability_v3.py`, para al menos dejar constancia medida de la latencia bajo contención en vez de asumirla por análisis.
+
+---
+
+### V3-MENOR-01 — Duplicación: la aritmética de crédito de wallet está copiada en dos funciones
+
+**Archivo 1:** `backend/app/db/queries/wallet_queries.py`, líneas 98–121 (`update_wallet_on_task_complete`)
+**Archivo 2:** `backend/app/db/queries/wallet_queries.py`, líneas 199–213 (`credit_reward_and_update_trust`, dentro del bloque `if valid:`)
+
+**Descripción:** Ambas funciones ejecutan el mismo `UPDATE wallets SET available_balance = available_balance + %s, total_earned = total_earned + %s WHERE provider_id = %s RETURNING ...` con el mismo `round(x, 2)` en los parámetros — literalmente el mismo SQL, en el mismo fichero, a menos de 100 líneas de distancia. El propio código de `credit_reward_and_update_trust` lo reconoce en su comentario ("misma aritmética que `update_wallet_on_task_complete`") pero no lo reutiliza, probablemente porque `update_wallet_on_task_complete` gestiona su propia conexión/transacción y no puede componerse dentro de la transacción ya abierta de `credit_reward_and_update_trust` sin refactorizar su firma para aceptar un cursor externo.
+
+**Impacto:** Bajo hoy (ambas copias son correctas y están cubiertas por tests), pero es el tipo de duplicación que diverge silenciosamente: un cambio futuro en el redondeo, en las columnas afectadas, o en una nueva regla de negocio sobre el crédito de wallet, tiene que aplicarse en dos sitios y es fácil olvidar uno.
+
+**Fix sugerido:** Extraer la lógica común a una función interna que opere sobre un cursor ya abierto, p. ej. `_credit_wallet(cur, provider_id, amount) -> dict`, y que tanto `update_wallet_on_task_complete` (abriendo su propia conexión y llamándola una vez) como `credit_reward_and_update_trust` (llamándola dentro de su transacción ya abierta) la reutilicen. No es urgente; se puede agrupar con la limpieza de V3-MAYOR-02.
+
+---
+
+### V3-MENOR-02 — Ejemplo de código desactualizado en `docs/04-api-contracts.md`
+
+**Archivo:** `docs/04-api-contracts.md`, bloque de código de `POST /work/claim` (justo antes de la nota "v3" añadida este ciclo)
+
+**Descripción:** El bloque SQL de ejemplo sigue mostrando la versión de una sola sentencia (pre-v3, con el `WITH overdue/_reject/candidates` fusionado). La nota añadida este ciclo aclara correctamente que es "la versión original (pre-v3)", pero queda como el código destacado en un bloque ```sql```, mientras que la versión real de 3 sentencias solo se describe en prosa en la nota. Alguien que copie/pegue el bloque de código sin leer la nota se lleva una versión que ya no corresponde a `compute_queries.py`.
+
+**Impacto:** Bajo — es documentación, no afecta al comportamiento del sistema, pero reduce la fiabilidad de este documento como referencia rápida.
+
+**Fix sugerido:** Sustituir el bloque de código por la versión v3 real (o un resumen fiel de las 3 sentencias), moviendo la nota histórica ("la versión pre-v3 era...") a pie de bloque en vez de al revés.
+
+---
+
+### V3-INFO-01 — Confirmado: `task_lifecycle.py` conserva el mismo patrón no transaccional de pago+trust, ya reconocido como deuda diferida
+
+**Archivo:** `backend/app/services/task_lifecycle.py`, `complete_task` líneas 130–213 y `fail_task` líneas 227–313
+
+**Descripción:** Releí el fichero completo para verificar si, tras corregir `consensus_service._pay_and_update_trust` en este ciclo, quedaba algún otro camino con el mismo problema de fondo (pago/trust en pasos separados, sin transacción conjunta, sin lock de fila). Confirmo que sí: `complete_task` llama a `wallet_queries.update_wallet_on_task_complete` (línea 144) y `wallet_queries.create_transaction` (línea 147) como pasos independientes y luego, más abajo, `get_provider_by_id`/`update_provider` (líneas 161–206) para el trust score, todo vía REST de Supabase sin ningún `FOR UPDATE` ni transacción psycopg2 que los agrupe. Es el mismo patrón que tenía `_pay_and_update_trust` antes de esta corrección.
+
+Esto **no es un hallazgo nuevo de este ciclo** — `docs/04-arquitectura.md` §14.3.1 ("Qué se decide NO cambiar") y §14.4 (punto 4) ya lo documentan explícitamente como deuda análoga, fuera de alcance a propósito, candidata a una "futura corrección simétrica". Confirmo que la documentación es honesta y precisa en este punto (a diferencia de la imprecisión señalada en V3-MAYOR-02). Se deja constancia aquí únicamente para que no se pierda como ítem de backlog al leer este documento de forma aislada de `docs/04-arquitectura.md` §14.
+
+**Impacto:** Ninguno nuevo — riesgo ya conocido y aceptado por el Architect para v3. Recomiendo que el Product Owner lo priorice explícitamente para v4 si la tasa de fallos observada en el flujo de tareas clásicas lo justifica, tal como ya sugiere §14.4.
+
+**Fix sugerido:** Ninguno para este ciclo. Cuando se aborde, el patrón a seguir es exactamente `wallet_queries.credit_reward_and_update_trust` (bloquear `providers` con `FOR UPDATE`, aplicar wallet+transaction+provider en una sola transacción psycopg2).
+
+---
+
+### Resumen ejecutivo de esta revisión
+
+| Severidad | Cantidad | IDs |
+|-----------|----------|-----|
+| CRÍTICO   | 0        | — |
+| MAYOR     | 3        | V3-MAYOR-01, V3-MAYOR-02, V3-MAYOR-03 |
+| MENOR     | 2        | V3-MENOR-01, V3-MENOR-02 |
+| INFO      | 1        | V3-INFO-01 |
+| **Total** | **6**    | |
+
+**Sobre las dos correcciones del encargo:** ambas están bien diseñadas y su lógica central es correcta. Verifiqué por lectura directa (no solo por el test de QA) que `credit_reward_and_update_trust` con `valid=False` nunca toca `wallets`/`transactions` (guardado por un único `if valid:` que envuelve ambas sentencias), que el rollback es automático por excepción dentro del `with conn:`, y que las tres sentencias de `claim_chunks_atomic` se ejecutan en el orden correcto dentro de la misma transacción para que la sentencia 3 vea los cambios (todavía no confirmados) de la sentencia 1. No encontré ningún bug de corrección en el camino feliz ni en los casos límite que tracé a mano (chunk reclamado y reasignado en la misma llamada, worker que entrega tarde para un chunk ya reasignado, chunk que agota intentos justo al ser reclamado por TTL).
+
+**Lo que sí falta** es rigor en tres frentes que exceden el "camino feliz": (1) una migración sin backfill que deja sin resolver los chunks que ya estaban atascados antes del despliegue — justo el problema que esta iniciativa existe para resolver — sin confirmación de que el paso manual de limpieza se ejecutó; (2) limpieza incompleta de la refactorización anterior (`wallet_service.credit_reward` huérfano, con una justificación documentada que no es cierta); (3) ausencia de cualquier test que ejerza concurrencia real (multi-hilo/multi-proceso) sobre `claim_chunks_atomic`, pese a ser precisamente el escenario que motivó el TTL en primer lugar. Ninguno de los tres es bloqueante para mergear, pero los tres deberían resolverse antes de considerar cerrado el punto 1 de "próximos pasos v3" de `docs/07-entrega.md`.
+
+**Veredicto:** Aprobado con seguimiento. No bloqueante — no hay hallazgos CRÍTICOS — pero V3-MAYOR-01 en particular debería verificarse (¿se limpiaron los chunks atascados preexistentes en producción?) antes de dar por cerrado el brief.
+
+---
+
+### Handoff al Security Auditor — ciclo Estabilidad v3
+
+1. **V3-MAYOR-01 (backfill ausente):** no es en sí un hallazgo de seguridad, pero si el Database Engineer ejecuta el `UPDATE` de limpieza manual recomendado en `docs/04-arquitectura.md` §14.5, confirmar que se ejecuta con las mismas credenciales/rol ya auditados (no un acceso ad-hoc con la `SUPABASE_SERVICE_ROLE_KEY` desde una máquina de desarrollador sin registro).
+2. **`credit_reward_and_update_trust` (`wallet_queries.py`) abre una conexión psycopg2 nueva por cada resultado de chunk liquidado** (antes usaba REST) — mismo perfil de riesgo ya cubierto en el handoff de la revisión de la feature de cómputo (uso de `SUPABASE_DB_URL`, variable de pool puerto 6543): confirmar que el límite de conexiones del pool de Supabase sigue siendo suficiente ahora que dos rutas más (`claim_chunks_atomic` ya existente, y esta función nueva) compiten por conexiones bajo carga, tal como ya señala `docs/04-arquitectura.md` §14.4 punto 2 (deuda de ausencia de pooling, no resuelta aquí).
+3. **Confirmar que el nuevo `_RaisingConn`/`_RaisingCursor` de `backend/tests/test_integration_reliability_v3.py`** (que monkeypatchea `psycopg2.connect` para inyectar un fallo a mitad de transacción) no queda activo fuera del test — revisé el `monkeypatch.undo()` explícito antes de las aserciones finales (líneas ~330 del fichero) y confirmo que restaura el `psycopg2.connect` real antes de verificar el estado en BD; no hay fuga hacia otros tests dentro del mismo proceso de pytest.
+4. Todo lo señalado en los handoffs de seguridad de los ciclos anteriores sigue vigente y no se ha vuelto a tocar en este ciclo — no hace falta re-auditarlo.

@@ -19,11 +19,8 @@ from uuid import UUID
 
 from fastapi import HTTPException, status
 
-from app.db.queries import compute_queries
-from app.db.queries.auth_queries import get_provider_by_id
-from app.db.queries.profile_queries import update_provider
+from app.db.queries import compute_queries, wallet_queries
 from app.models.compute import SubmitResponse
-from app.services import trust_score, wallet_service
 
 logger = logging.getLogger(__name__)
 
@@ -41,47 +38,19 @@ def _canonical(result: Any) -> str:
 
 
 def _pay_and_update_trust(provider_id: str, chunk_id: str, valid: bool) -> None:
-    """Pay (if valid) and update accuracy for one provider result."""
+    """Pago (si valid) y actualización de trust, atómicos, para un resultado de chunk."""
     try:
-        if valid:
-            wallet_service.credit_reward(
-                provider_id=str(provider_id),
-                amount=REWARD_PER_CHUNK,
-                description=f"Recompensa por chunk validado: {chunk_id}",
-            )
-        provider = get_provider_by_id(str(provider_id))
-        if provider is None:
-            logger.warning("Provider %s not found for trust update", provider_id)
-            return
-
-        current_accuracy = float(provider.get("accuracy", 80.0))
-        if valid:
-            new_accuracy = trust_score.update_accuracy_on_complete(current_accuracy)
-        else:
-            new_accuracy = trust_score.update_accuracy_on_fail(current_accuracy)
-
-        new_ts = trust_score.calculate_trust_score(
-            completion_rate=float(provider.get("completion_rate", 0.0)),
-            accuracy=new_accuracy,
-            response_time_score=float(provider.get("response_time_score", 70.0)),
-            client_rating=float(provider.get("client_rating", 70.0)),
-        )
-        new_rank = trust_score.get_rank(new_ts)
-        update_provider(
-            str(provider_id),
-            {
-                "accuracy": new_accuracy,
-                "trust_score": new_ts,
-                "rank": new_rank,
-            },
+        wallet_queries.credit_reward_and_update_trust(
+            provider_id=str(provider_id),
+            valid=valid,
+            reward_amount=REWARD_PER_CHUNK,
+            description=f"Recompensa por chunk validado: {chunk_id}",
         )
     except Exception as exc:
         logger.error(
-            "Error en pago/trust para proveedor %s chunk %s: %s",
-            provider_id,
-            chunk_id,
-            exc,
-            exc_info=True,
+            "Pago/trust (transaccional) fallido para proveedor %s, chunk %s — "
+            "ninguna de las dos operaciones se aplicó, requiere reconciliación manual: %s",
+            provider_id, chunk_id, exc, exc_info=True,
         )
 
 
@@ -118,6 +87,18 @@ def _try_close_job(job_id: str) -> None:
 
     except Exception as exc:
         logger.error("Error en _try_close_job %s: %s", job_id, exc, exc_info=True)
+
+
+def process_chunk_claim(provider_id: str, max_chunks: int) -> list[dict[str, Any]]:
+    """
+    Punto de entrada de servicio para POST /work/claim.
+    Reclama chunks para provider_id y, si el reclamo atómico rechazó chunks
+    por exceso de intentos, revisa si alguno de esos jobs debe cerrarse.
+    """
+    claimed, rejected_job_ids = compute_queries.claim_chunks_atomic(provider_id, max_chunks)
+    for job_id in rejected_job_ids:
+        _try_close_job(job_id)
+    return claimed
 
 
 def process_chunk_submission(

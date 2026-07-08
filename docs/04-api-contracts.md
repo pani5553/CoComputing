@@ -1218,6 +1218,7 @@ Esta sección documenta el pipeline de cómputo distribuido añadido en la featu
 | `payload` | `jsonb` | NO | — | Para `data-processing`: `{"rows":[[...]],"columns":["col1"]}` |
 | `status` | `text` | NO | `'pending'` | `pending` \| `assigned` \| `done` \| `rejected` |
 | `assigned_to` | `uuid` | SÍ | `null` | FK → `providers.id`. NULL cuando está `pending` o `rejected`. |
+| `assigned_at` | `timestamptz` | SÍ | `null` | **v3.** Timestamp de la asignación vigente. NULL si `status != 'assigned'`. Usado para el TTL de reclamo perezoso (10 min) — ver `docs/04-arquitectura.md` §14.2. |
 | `attempts` | `integer` | NO | `0` | Veces que el scheduler ha intentado asignar este chunk. |
 | `replicas_needed` | `integer` | NO | `2` | Número de proveedores distintos que deben procesar el chunk para consenso. |
 | `created_at` | `timestamptz` | NO | `now()` | |
@@ -1234,6 +1235,7 @@ Esta sección documenta el pipeline de cómputo distribuido añadido en la featu
 - `idx_chunks_status` en `(status)`
 - `idx_chunks_job_status` en `(job_id, status)`
 - `idx_chunks_assigned_to` parcial en `(assigned_to) WHERE assigned_to IS NOT NULL`
+- `idx_chunks_assigned_at` parcial en `(assigned_at) WHERE status = 'assigned'` — **v3**, `migrations/006_chunk_ttl.sql`
 
 **Nota sobre `replicas_needed` vs `assigned_to`:** La columna `assigned_to` registra solo al proveedor con asignación activa más reciente (para reintento). El conteo real de resultados entregados se obtiene de `chunk_results`. El claim atómico lee `chunk_results` para determinar cuántas réplicas faltan antes de marcar el chunk como `done`.
 
@@ -1672,6 +1674,8 @@ RETURNING chunks.id, chunks.job_id, chunks.chunk_index,
 ```
 
 `FOR UPDATE SKIP LOCKED` garantiza que dos workers concurrentes no reclamen el mismo chunk. No bloquea; el segundo worker simplemente recibe el siguiente chunk disponible.
+
+> **Nota v3:** la query mostrada arriba es la versión original (pre-v3). Desde la corrección de estabilidad v3, `claim_chunks_atomic` ejecuta un paso adicional de reclamo por TTL antes de esta query (y añade `assigned_at = now()` a este UPDATE) y devuelve además los `job_id` de cualquier chunk rechazado por exceder `MAX_CHUNK_ATTEMPTS`. El request/response de este endpoint no cambia. Ver el diseño completo y la razón de cada cambio en `docs/04-arquitectura.md` §14.2.
 
 **Request body:**
 

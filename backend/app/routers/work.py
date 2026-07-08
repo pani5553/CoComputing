@@ -10,7 +10,6 @@ from fastapi import APIRouter, Depends, status
 from app.core.dependencies import get_current_provider
 from app.models.compute import ClaimRequest, ClaimResponse, SubmitRequest, SubmitResponse
 from app.services import consensus_service
-from app.db.queries import compute_queries
 from app.models.compute import ChunkWithPayload
 
 logger = logging.getLogger(__name__)
@@ -28,7 +27,7 @@ def claim_chunks(
     Returns an empty list when no chunks are available.
     """
     provider_id = str(provider["id"])
-    rows = compute_queries.claim_chunks_atomic(provider_id, body.max_chunks)
+    rows = consensus_service.process_chunk_claim(provider_id, body.max_chunks)
 
     chunks = [
         ChunkWithPayload(

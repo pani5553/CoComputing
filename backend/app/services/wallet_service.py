@@ -1,14 +1,11 @@
 """
 Wallet service: balance retrieval, transactions, and withdrawal logic.
 """
-import logging
 from typing import Any
 
 from fastapi import HTTPException, status
 
 from app.db.queries import wallet_queries
-
-logger = logging.getLogger(__name__)
 
 
 MIN_WITHDRAW_AMOUNT = 10.0
@@ -101,25 +98,3 @@ def process_withdrawal(
         "new_available_balance": float(updated_wallet["available_balance"]),
         "message": "Solicitud de retiro registrada. Te contactaremos cuando se procese.",
     }
-
-
-def credit_reward(provider_id: str, amount: float, description: str) -> None:
-    """
-    Credit amount to wallets.available_balance and total_earned for the provider.
-    Creates a transaction row (tx_type='pago_tarea', status='completada').
-    Used by consensus_service to pay providers for valid chunk results.
-    """
-    try:
-        wallet_queries.update_wallet_on_task_complete(provider_id, amount)
-        wallet_queries.create_transaction(
-            provider_id=provider_id,
-            amount=amount,
-            tx_type="pago_tarea",
-            description=description,
-            status="completada",
-        )
-    except Exception as exc:
-        logger.error(
-            "Error acreditando recompensa al proveedor %s: %s", provider_id, exc, exc_info=True
-        )
-        raise

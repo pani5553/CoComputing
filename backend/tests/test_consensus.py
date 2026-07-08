@@ -1,7 +1,7 @@
 """
 Tests for consensus_service — chunk validation, payment and trust update logic.
 
-All external calls (DB queries, wallet_service, trust_score updates) are mocked.
+All external calls (DB queries, wallet_queries.credit_reward_and_update_trust) are mocked.
 Test IDs: K-01 to K-07 (from docs/04-arquitectura.md §12.9)
 """
 import uuid
@@ -82,9 +82,7 @@ def _provider_dict(provider_id):
 # ── K-01: Two workers send same result → both valid, chunk=done ──────────────
 
 @patch("app.services.consensus_service._try_close_job")
-@patch("app.db.queries.profile_queries.update_provider")
-@patch("app.db.queries.auth_queries.get_provider_by_id")
-@patch("app.services.wallet_service.credit_reward")
+@patch("app.db.queries.wallet_queries.credit_reward_and_update_trust")
 @patch("app.db.queries.compute_queries.increment_job_completed_chunks")
 @patch("app.db.queries.compute_queries.update_chunk_status")
 @patch("app.db.queries.compute_queries.validate_chunk_result")
@@ -98,9 +96,7 @@ def test_k01_two_same_results_both_valid_chunk_done(
     mock_validate,
     mock_update_chunk,
     mock_increment,
-    mock_credit,
-    mock_get_provider,
-    mock_update_provider,
+    mock_credit_and_trust,
     mock_try_close,
 ):
     """K-01: Two workers send identical results → both is_valid=True, chunk=done."""
@@ -117,7 +113,7 @@ def test_k01_two_same_results_both_valid_chunk_done(
     ]
 
     mock_increment.return_value = _make_job(completed_chunks=1)
-    mock_get_provider.return_value = _provider_dict(PROVIDER_B)
+    mock_credit_and_trust.return_value = _provider_dict(PROVIDER_B)
 
     from app.services.consensus_service import process_chunk_submission
 
@@ -134,7 +130,10 @@ def test_k01_two_same_results_both_valid_chunk_done(
     # Both results marked valid
     for c in mock_validate.call_args_list:
         assert c.args[1] is True
-    mock_credit.assert_called()
+    # Both providers paid+trust-updated with valid=True
+    assert mock_credit_and_trust.call_count == 2
+    for c in mock_credit_and_trust.call_args_list:
+        assert c.kwargs["valid"] is True
     mock_try_close.assert_called_once_with(JOB_ID)
 
 
@@ -178,9 +177,7 @@ def test_k02_two_different_results_chunk_back_to_pending(
 # ── K-03: 3rd worker breaks tie with majority ────────────────────────────────
 
 @patch("app.services.consensus_service._try_close_job")
-@patch("app.db.queries.profile_queries.update_provider")
-@patch("app.db.queries.auth_queries.get_provider_by_id")
-@patch("app.services.wallet_service.credit_reward")
+@patch("app.db.queries.wallet_queries.credit_reward_and_update_trust")
 @patch("app.db.queries.compute_queries.increment_job_completed_chunks")
 @patch("app.db.queries.compute_queries.update_chunk_status")
 @patch("app.db.queries.compute_queries.validate_chunk_result")
@@ -194,9 +191,7 @@ def test_k03_tiebreaker_majority_wins(
     mock_validate,
     mock_update_chunk,
     mock_increment,
-    mock_credit,
-    mock_get_provider,
-    mock_update_provider,
+    mock_credit_and_trust,
     mock_try_close,
 ):
     """K-03: A and C agree, B disagrees → A and C valid, B invalid, chunk=done."""
@@ -214,7 +209,7 @@ def test_k03_tiebreaker_majority_wins(
         [cr_a, cr_b, cr_c],     # consensus evaluation
     ]
     mock_increment.return_value = _make_job(completed_chunks=1)
-    mock_get_provider.return_value = _provider_dict(PROVIDER_C)
+    mock_credit_and_trust.return_value = _provider_dict(PROVIDER_C)
 
     from app.services.consensus_service import process_chunk_submission
 
@@ -238,9 +233,7 @@ def test_k03_tiebreaker_majority_wins(
 # ── K-04: All 3 results different → all invalid, chunk=rejected ──────────────
 
 @patch("app.services.consensus_service._try_close_job")
-@patch("app.db.queries.profile_queries.update_provider")
-@patch("app.db.queries.auth_queries.get_provider_by_id")
-@patch("app.services.wallet_service.credit_reward")
+@patch("app.db.queries.wallet_queries.credit_reward_and_update_trust")
 @patch("app.db.queries.compute_queries.update_chunk_status")
 @patch("app.db.queries.compute_queries.validate_chunk_result")
 @patch("app.db.queries.compute_queries.get_chunk_results")
@@ -252,9 +245,7 @@ def test_k04_all_three_different_chunk_rejected(
     mock_get_results,
     mock_validate,
     mock_update_chunk,
-    mock_credit,
-    mock_get_provider,
-    mock_update_provider,
+    mock_credit_and_trust,
     mock_try_close,
 ):
     """K-04: All 3 results differ → all is_valid=False, chunk=rejected."""
@@ -269,7 +260,7 @@ def test_k04_all_three_different_chunk_rejected(
         [cr_a, cr_b],           # already_submitted check: C not yet in list
         [cr_a, cr_b, cr_c],     # consensus evaluation
     ]
-    mock_get_provider.return_value = _provider_dict(PROVIDER_C)
+    mock_credit_and_trust.return_value = _provider_dict(PROVIDER_C)
 
     from app.services.consensus_service import process_chunk_submission
 
@@ -285,8 +276,10 @@ def test_k04_all_three_different_chunk_rejected(
     # All 3 marked invalid
     for c in mock_validate.call_args_list:
         assert c.args[1] is False
-    # No payment for invalid results
-    mock_credit.assert_not_called()
+    # All 3 providers processed with valid=False (no reward credited)
+    assert mock_credit_and_trust.call_count == 3
+    for c in mock_credit_and_trust.call_args_list:
+        assert c.kwargs["valid"] is False
     mock_try_close.assert_called_once_with(JOB_ID)
 
 
@@ -414,3 +407,122 @@ def test_submit_chunk_not_found_returns_404(mock_get_chunk):
             duration_ms=100,
         )
     assert exc_info.value.status_code == 404
+
+
+# ── Extra (v3): process_chunk_claim — TTL reclaim closes jobs left stuck ────
+#
+# claim_chunks_atomic itself (the 3-statement TTL reclaim / attempts-reject /
+# claim transaction) requires a real Postgres connection to exercise honestly
+# and is intentionally left for an integration test against a real test DB
+# (see docs/04-arquitectura.md §14.7 — no existing test in this project
+# mocks psycopg2 for that purpose). What IS unit-testable, and matters most
+# for regression safety, is the new service-layer orchestration added on top
+# of it: process_chunk_claim must forward the claimed chunks unchanged and
+# must call _try_close_job exactly once per job_id rejected for exceeding
+# MAX_CHUNK_ATTEMPTS — closing the "job stuck forever" gap described in
+# §14.2.5.
+
+@patch("app.services.consensus_service._try_close_job")
+@patch("app.db.queries.compute_queries.claim_chunks_atomic")
+def test_process_chunk_claim_closes_jobs_rejected_by_attempts(
+    mock_claim_atomic, mock_try_close
+):
+    """
+    process_chunk_claim must call _try_close_job for every job_id returned as
+    rejected-by-attempts, and return the claimed chunks unchanged.
+    """
+    claimed_chunks = [
+        {
+            "chunk_id": CHUNK_ID,
+            "job_id": JOB_ID,
+            "chunk_index": 0,
+            "payload": {},
+            "replicas_needed": 2,
+            "job_type": "data-processing",
+        }
+    ]
+    other_job_id = str(uuid.uuid4())
+    mock_claim_atomic.return_value = (claimed_chunks, [JOB_ID, other_job_id])
+
+    from app.services.consensus_service import process_chunk_claim
+
+    result = process_chunk_claim(PROVIDER_A, max_chunks=5)
+
+    assert result == claimed_chunks
+    mock_claim_atomic.assert_called_once_with(PROVIDER_A, 5)
+    assert mock_try_close.call_count == 2
+    mock_try_close.assert_any_call(JOB_ID)
+    mock_try_close.assert_any_call(other_job_id)
+
+
+@patch("app.services.consensus_service._try_close_job")
+@patch("app.db.queries.compute_queries.claim_chunks_atomic")
+def test_process_chunk_claim_no_rejections_no_close_job_calls(
+    mock_claim_atomic, mock_try_close
+):
+    """When nothing was rejected by attempts, _try_close_job is never called."""
+    mock_claim_atomic.return_value = ([], [])
+
+    from app.services.consensus_service import process_chunk_claim
+
+    result = process_chunk_claim(PROVIDER_A, max_chunks=5)
+
+    assert result == []
+    mock_try_close.assert_not_called()
+
+
+# ── Extra (v3): pago + trust no dejan estado a medias ────────────────────────
+#
+# Before this change, _pay_and_update_trust called wallet_service.credit_reward
+# and then, as a SEPARATE step, get_provider_by_id/update_provider — a failure
+# in the second step left the provider paid but with stale trust/rank. Now
+# both are a single call to wallet_queries.credit_reward_and_update_trust
+# (one psycopg2 transaction); if it raises, _pay_and_update_trust must not
+# perform any other side effect (there is none left to perform) and must not
+# propagate the exception (documented, deliberate — see §14.3.1).
+
+@patch("app.db.queries.wallet_queries.credit_reward_and_update_trust")
+def test_pay_and_update_trust_failure_is_all_or_nothing_and_does_not_raise(
+    mock_credit_and_trust,
+):
+    """
+    If credit_reward_and_update_trust raises (e.g. the whole transaction rolled
+    back), _pay_and_update_trust must swallow the exception (logged, not
+    re-raised — same external contract as before) and must not call any other
+    payment/trust function, since none exists anymore: the single call either
+    fully applies or fully rolls back.
+    """
+    mock_credit_and_trust.side_effect = RuntimeError("connection reset")
+
+    from app.services.consensus_service import _pay_and_update_trust
+
+    # Must not raise.
+    _pay_and_update_trust(PROVIDER_A, CHUNK_ID, valid=True)
+
+    mock_credit_and_trust.assert_called_once_with(
+        provider_id=PROVIDER_A,
+        valid=True,
+        reward_amount=0.10,
+        description=f"Recompensa por chunk validado: {CHUNK_ID}",
+    )
+
+
+@patch("app.db.queries.wallet_queries.credit_reward_and_update_trust")
+def test_pay_and_update_trust_success_calls_single_transactional_function(
+    mock_credit_and_trust,
+):
+    """Happy path: exactly one call, no separate wallet/trust calls remain."""
+    mock_credit_and_trust.return_value = {
+        "accuracy": 82.0, "trust_score": 74.0, "rank": "confiable"
+    }
+
+    from app.services.consensus_service import _pay_and_update_trust
+
+    _pay_and_update_trust(PROVIDER_B, CHUNK_ID, valid=False)
+
+    mock_credit_and_trust.assert_called_once_with(
+        provider_id=PROVIDER_B,
+        valid=False,
+        reward_amount=0.10,
+        description=f"Recompensa por chunk validado: {CHUNK_ID}",
+    )
