@@ -19,6 +19,7 @@
 | Recurso no encontrado | `404 Not Found` con body `{"detail": "<mensaje legible>"}` |
 | Error de validación | `422 Unprocessable Entity` con body Pydantic estándar |
 | Error de negocio | `400 Bad Request` con body `{"detail": "<mensaje legible en español>"}` |
+| Rate limit excedido | `429 Too Many Requests` con body `{"detail": "Demasiadas peticiones. Inténtalo de nuevo en unos instantes."}` y cabecera `Retry-After: <segundos>` — ver `docs/04-arquitectura.md` §15.1 (endurecimiento 2026-07-08) |
 | Error de servidor | `500 Internal Server Error` con body `{"detail": "Error interno del servidor"}` |
 | Campos de fecha | ISO 8601 en UTC: `"2026-06-05T14:32:00Z"` |
 | Moneda | `float` con 2 decimales. La unidad es CC (Co-Computing Credits). |
@@ -177,6 +178,25 @@ providers (1) ──── (1) wallets
 
 ---
 
+### 1.7 Tabla `rate_limit_counters` (nueva — Endurecimiento de seguridad, 2026-07-08)
+
+Ver diseño completo en `docs/04-arquitectura.md` §15.1. Contador de rate limiting compartido entre los procesos Uvicorn (`--workers 2`), respaldado por Postgres porque el proyecto no tiene Redis. Usada por `POST /auth/login`, `POST /auth/register`, `POST /work/claim` y `POST /work/{chunk_id}/submit`.
+
+| Campo | Tipo PostgreSQL | Nulo | Defecto | Descripción |
+|-------|----------------|------|---------|-------------|
+| `bucket` | `text` | NO | — | Identidad + scope del limitador, formato `"<scope>:<ip\|provider>:<identidad>"`, ej. `"login:ip:203.0.113.5"` o `"work_claim:provider:550e8400-..."` |
+| `window_start` | `timestamptz` | NO | — | Inicio de la ventana fija (redondeado hacia abajo al múltiplo de `window_seconds` más cercano) |
+| `request_count` | `integer` | NO | `0` | Peticiones contabilizadas en esta ventana para este bucket |
+
+**Restricciones:**
+- `PRIMARY KEY (bucket, window_start)` — también sirve de índice para el `UPSERT` atómico y para la limpieza perezoza de filas antiguas.
+
+**Sin índices adicionales.** No tiene RLS ni políticas: se accede exclusivamente vía conexión psycopg2 directa (`SUPABASE_DB_URL`), nunca vía el SDK REST de Supabase — mismo patrón que `chunks`/`jobs` para operaciones que requieren atomicidad.
+
+**Limpieza:** perezosa, sin scheduler — cada llamada a `check_rate_limit` borra, con 1% de probabilidad, las filas con `window_start` de más de 1 hora de antigüedad (mismo patrón de "reclamo perezoso sin scheduler" ya usado en §14.2.1 para el TTL de chunks).
+
+---
+
 ## 2. Contratos de API
 
 ---
@@ -248,6 +268,16 @@ Crea una nueva cuenta de proveedor. No requiere autenticación.
 }
 ```
 
+**Response 429 — Límite de registros por IP excedido (5/hora, ver `docs/04-arquitectura.md` §15.1 y §15.4):**
+
+```json
+{
+  "detail": "Demasiadas peticiones. Inténtalo de nuevo en unos instantes."
+}
+```
+
+Cabecera de respuesta: `Retry-After: 3600`.
+
 ---
 
 #### `POST /auth/login`
@@ -305,6 +335,16 @@ El JWT tiene claim `sub` = `provider.id` (UUID string) y `exp` = ahora + 7 días
 ```
 
 El mensaje es idéntico en ambos casos para no revelar si el email existe.
+
+**Response 429 — Límite de intentos por IP excedido (10/minuto, ver `docs/04-arquitectura.md` §15.1):**
+
+```json
+{
+  "detail": "Demasiadas peticiones. Inténtalo de nuevo en unos instantes."
+}
+```
+
+Cabecera de respuesta: `Retry-After: 60`.
 
 ---
 
@@ -1728,6 +1768,14 @@ El worker interpreta una lista vacía como "nada que procesar ahora" y espera an
 
 **Response 422 — Validación de body fallida (ej. max_chunks = 0).**
 
+**Response 429 — Límite de reclamos por proveedor excedido (30/minuto, ver `docs/04-arquitectura.md` §15.1):**
+
+```json
+{ "detail": "Demasiadas peticiones. Inténtalo de nuevo en unos instantes." }
+```
+
+Cabecera de respuesta: `Retry-After: 60`. Identidad del bucket: `provider_id` del JWT, no la IP (varios workers legítimos pueden compartir IP/NAT).
+
 ---
 
 #### `POST /work/{chunk_id}/submit` [AUTH]
@@ -1805,6 +1853,14 @@ En este caso el servicio cambia el chunk de vuelta a `pending` para que otro wor
 ```json
 { "detail": "Chunk no encontrado" }
 ```
+
+**Response 429 — Límite de submits por proveedor excedido (60/minuto, ver `docs/04-arquitectura.md` §15.1):**
+
+```json
+{ "detail": "Demasiadas peticiones. Inténtalo de nuevo en unos instantes." }
+```
+
+Cabecera de respuesta: `Retry-After: 60`.
 
 ---
 

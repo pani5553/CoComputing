@@ -1,6 +1,12 @@
+import re
 from datetime import datetime
 
 from pydantic import BaseModel, EmailStr, Field, field_validator
+
+# Mitigación básica de Sybil en /auth/register (docs/04-arquitectura.md §15.4):
+# EmailStr ya valida sintaxis RFC, pero no detecta puntos consecutivos ni una
+# parte local desproporcionadamente larga.
+_CONSECUTIVE_DOTS = re.compile(r"\.\.")
 
 
 class RegisterRequest(BaseModel):
@@ -11,6 +17,23 @@ class RegisterRequest(BaseModel):
         min_length=8,
         description="La contraseña debe tener al menos 8 caracteres",
     )
+
+    @field_validator("email")
+    @classmethod
+    def email_format_strict(cls, v: str) -> str:
+        """
+        Validación de formato adicional a EmailStr + normalización a
+        minúsculas. La normalización es el cambio con más impacto real:
+        sin ella, "Ana@Example.com" y "ana@example.com" se tratarían como
+        cuentas distintas por `get_provider_by_email`, evadiendo el límite
+        de "una cuenta por email" sin necesitar ningún ataque Sybil.
+        """
+        local_part = v.split("@", 1)[0]
+        if _CONSECUTIVE_DOTS.search(v):
+            raise ValueError("El email no puede contener puntos consecutivos")
+        if len(local_part) > 64:
+            raise ValueError("La parte local del email es demasiado larga")
+        return v.lower()
 
     @field_validator("password")
     @classmethod
@@ -23,6 +46,24 @@ class RegisterRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=1)
+
+    @field_validator("email")
+    @classmethod
+    def email_normalize(cls, v: str) -> str:
+        """
+        Normaliza el email a minúsculas para que coincida con el valor
+        guardado por `RegisterRequest.email_format_strict` (que sí
+        normaliza). Sin esto, un usuario que inicia sesión con el email
+        exactamente como lo escribió al registrarse (p. ej. con
+        mayúsculas) recibe un falso "Credenciales incorrectas", porque
+        `get_provider_by_email` compara con `.eq("email", email)` contra
+        una columna sin `citext` ni índice `lower()`. No se duplica aquí
+        el resto de la validación estricta de formato (puntos
+        consecutivos, longitud de la parte local): login no debe
+        rechazar por formato, un email inexistente ya se maneja como
+        credenciales incorrectas.
+        """
+        return v.lower()
 
 
 class ProviderPublic(BaseModel):

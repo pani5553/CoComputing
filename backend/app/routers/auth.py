@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.core.config import settings
 from app.core.dependencies import get_current_provider
+from app.core.rate_limit import rate_limit_by_ip
 from app.core.security import create_access_token, hash_password, verify_password
 from app.db.queries.auth_queries import (
     create_provider,
@@ -15,8 +16,19 @@ from app.models.auth import LoginRequest, ProviderMe, ProviderPublic, RegisterRe
 
 router = APIRouter()
 
+# Instancias de dependencia expuestas a nivel de módulo (no inline en el
+# decorador) para que los tests puedan sobreescribirlas vía
+# app.dependency_overrides — ver tests/conftest.py y docs/04-arquitectura.md §15.8.
+register_rate_limiter = rate_limit_by_ip("register", limit=5, window_seconds=3600)
+login_rate_limiter = rate_limit_by_ip("login", limit=10, window_seconds=60)
 
-@router.post("/register", response_model=ProviderPublic, status_code=status.HTTP_201_CREATED)
+
+@router.post(
+    "/register",
+    response_model=ProviderPublic,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(register_rate_limiter)],
+)
 def register(payload: RegisterRequest) -> ProviderPublic:
     """
     Register a new provider account.
@@ -51,7 +63,11 @@ def register(payload: RegisterRequest) -> ProviderPublic:
     return ProviderPublic(**provider)
 
 
-@router.post("/login", response_model=TokenResponse)
+@router.post(
+    "/login",
+    response_model=TokenResponse,
+    dependencies=[Depends(login_rate_limiter)],
+)
 def login(payload: LoginRequest) -> TokenResponse:
     """
     Authenticate a provider and return a JWT.

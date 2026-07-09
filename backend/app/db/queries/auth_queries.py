@@ -8,11 +8,21 @@ from app.db.client import get_supabase
 
 
 def get_provider_by_email(email: str) -> dict[str, Any] | None:
-    """Fetch a provider row by email. Returns None if not found."""
+    """
+    Fetch a provider row by email. Returns None if not found.
+
+    Normalizes to lowercase here (defense in depth — EN-CRIT-01,
+    docs/05-review.md 2026-07-09), not just at the Pydantic model layer
+    (LoginRequest.email_normalize / RegisterRequest.email_format_strict).
+    `providers.email` has no `citext`/`lower()` index, so any future caller
+    of this function that bypasses request validation (a script, another
+    service, a direct call) must not be able to reintroduce a
+    case-sensitive lookup mismatch against a normalized-on-write column.
+    """
     response = (
         get_supabase().table("providers")
         .select("*")
-        .eq("email", email)
+        .eq("email", email.lower())
         .limit(1)
         .execute()
     )

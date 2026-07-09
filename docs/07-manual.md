@@ -292,10 +292,22 @@ Si quieres contribuir capacidad de computo al pipeline distribuido y ganar recom
 
 ### Arrancar el worker
 
+**Metodo recomendado — variables de entorno:**
+
 ```bash
 cd backend
+export CC_WORKER_EMAIL=tu@email.com
+export CC_WORKER_PASSWORD=tupassword
+python -m app.worker --api http://localhost:8000
+```
+
+**Alternativa en desuso — argumentos CLI:**
+
+```bash
 python -m app.worker --api http://localhost:8000 --email tu@email.com --password tupassword
 ```
+
+Los argumentos `--email`/`--password` siguen funcionando por compatibilidad hacia atras, pero exponen la contrasena en `ps aux` y en el historial de shell, y muestran una advertencia de deprecacion en cada arranque. Si se definen ambos metodos a la vez, la variable de entorno tiene prioridad. Usar unicamente las variables de entorno en produccion.
 
 El worker realiza las siguientes operaciones de forma continua hasta que se detiene con `Ctrl+C`:
 
@@ -323,7 +335,7 @@ Las recompensas aparecen en el historial de transacciones de la cartera con desc
 
 ### Advertencia de seguridad
 
-El worker ejecuta computo sobre payloads recibidos de la API sin aislamiento de seguridad. No ejecutar el worker conectado a una API de origen desconocido. Ver la nota de seguridad en el README del repositorio.
+El worker aisla cada chunk en un subproceso separado con timeout y limites de CPU/memoria, para que un payload problematico no tumbe el proceso worker completo. Esto no es un sandbox completo: no hay aislamiento de red ni de filesystem. No ejecutar el worker conectado a una API de origen desconocido. Ver la nota de seguridad en el README del repositorio.
 
 ---
 

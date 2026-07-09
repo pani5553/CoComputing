@@ -1474,3 +1474,149 @@ Esto **no es un hallazgo nuevo de este ciclo** — `docs/04-arquitectura.md` §1
 2. **`credit_reward_and_update_trust` (`wallet_queries.py`) abre una conexión psycopg2 nueva por cada resultado de chunk liquidado** (antes usaba REST) — mismo perfil de riesgo ya cubierto en el handoff de la revisión de la feature de cómputo (uso de `SUPABASE_DB_URL`, variable de pool puerto 6543): confirmar que el límite de conexiones del pool de Supabase sigue siendo suficiente ahora que dos rutas más (`claim_chunks_atomic` ya existente, y esta función nueva) compiten por conexiones bajo carga, tal como ya señala `docs/04-arquitectura.md` §14.4 punto 2 (deuda de ausencia de pooling, no resuelta aquí).
 3. **Confirmar que el nuevo `_RaisingConn`/`_RaisingCursor` de `backend/tests/test_integration_reliability_v3.py`** (que monkeypatchea `psycopg2.connect` para inyectar un fallo a mitad de transacción) no queda activo fuera del test — revisé el `monkeypatch.undo()` explícito antes de las aserciones finales (líneas ~330 del fichero) y confirmo que restaura el `psycopg2.connect` real antes de verificar el estado en BD; no hay fuga hacia otros tests dentro del mismo proceso de pytest.
 4. Todo lo señalado en los handoffs de seguridad de los ciclos anteriores sigue vigente y no se ha vuelto a tocar en este ciclo — no hace falta re-auditarlo.
+
+---
+
+## Revisión — Endurecimiento de Seguridad Pre-Lanzamiento (Rate Limiting, Credenciales Worker, Sandbox, Sybil) — 2026-07-09
+
+**Revisor:** Code Reviewer Senior
+**Scope:** `backend/app/core/rate_limit.py`, `backend/app/worker/sandbox.py`, `backend/app/worker/main.py`, `backend/app/worker/run_workers.sh`, `backend/app/routers/auth.py`, `backend/app/routers/work.py`, `backend/app/models/auth.py`, `backend/app/core/config.py`, `backend/tests/test_rate_limit.py`, `backend/tests/test_worker.py`, `backend/tests/test_auth.py`, `backend/tests/conftest.py`, `migrations/008_rate_limiting.sql`, `docs/04-arquitectura.md` §15, `docs/04-api-contracts.md` §1.7, `docs/04-estructura.md`.
+**Referencia:** `docs/04-arquitectura.md` §15 (diseño), reporte de QA (102 passed, 2 skipped, gate de cobertura 80% fallando en ~60%).
+
+No doy nada por bueno solo porque QA/Backend Dev digan que funciona: reproduje en local el bug del BOM y el de `CORS_ORIGINS` haciendo `git stash` de `config.py` y ejecutando la suite contra el `backend/.env` real del repo (ver EN-INFO-01); ejecuté la suite completa con cobertura para verificar de primera mano el 60.33%; y aislé la contribución de los ficheros nuevos (`rate_limit.py`, `sandbox.py`) al cálculo de cobertura para confirmar o refutar la hipótesis de "deuda preexistente" de QA en vez de asumirla.
+
+### Índice de hallazgos
+
+| ID | Severidad | Resumen |
+|----|-----------|---------|
+| EN-CRIT-01 | CRÍTICO | La normalización de email a minúsculas en `LoginRequest` (fix del bug de QA) no viene acompañada de ninguna migración de backfill sobre `providers.email` — cualquier cuenta ya existente registrada con mayúsculas antes de este ciclo queda bloqueada fuera de su cuenta la próxima vez que inicie sesión escribiendo su email tal como lo registró |
+| EN-MAYOR-01 | MAYOR | `extra="ignore"` en `Settings` cambia el comportamiento por defecto de `pydantic-settings` (que es `extra="forbid"`, confirmado en el entorno) — una variable de entorno mal escrita en producción para un campo con valor por defecto (en particular `ENVIRONMENT`) deja de fallar alto y pasa a degradarse en silencio al valor por defecto `"development"`, reactivando `/docs`, `/redoc`, `/openapi.json` y logging verboso en un despliegue que se creía en producción |
+| EN-MAYOR-02 | MAYOR | El rate limiting añade una conexión psycopg2 directa (pooler, puerto 6543) a `/auth/login` y `/auth/register`, que antes de este ciclo no tenían ninguna dependencia de psycopg2 (usan el SDK REST de Supabase) — sin ningún `try/except` alrededor de `psycopg2.connect`/`execute`, una incidencia puntual del pooler tumba login y registro con 500 aunque el REST de Supabase esté sano; `docs/04-arquitectura.md` §15.0 subestima esto al llamarlo "marginal" comparándolo con una consulta REST ya existente, que es una ruta de conexión distinta con disponibilidad independiente |
+| EN-MENOR-01 | MENOR | `check_rate_limit` nunca cierra explícitamente la conexión psycopg2 (`with psycopg2.connect(...) as conn:` hace commit/rollback al salir del bloque pero **no cierra la conexión** — comportamiento documentado y conocido de psycopg2); en CPython el refcounting cierra el socket al salir de la función, pero es un comportamiento implícito y fràgil, no el idioma estándar (`try/finally` con `conn.close()`) |
+| EN-MENOR-02 | MENOR | El único test de timeout del sandbox (`test_run_chunk_sandboxed_aborts_cleanly_on_timeout`) no ejercita un bucle infinito genuino — reduce `CHUNK_TIMEOUT_SECONDS` a 0 y se apoya en que el arranque del subproceso (spawn + import) tarda más que ese presupuesto, no en interrumpir un cómputo realmente en marcha; esto contradice la caracterización de QA ("bucle infinito genuino, no mockeado") para la suite automatizada, aunque coincide con lo que el propio `docs/04-arquitectura.md` §15.8 sugería probar de otra forma (un plugin que duerma más que el timeout) |
+| EN-INFO-01 | INFO | Confirmado por reproducción directa: el bug del BOM y el de `CORS_ORIGINS` eran reales (antes de este ciclo, `Settings()` fallaba con `ValidationError` exactamente por `﻿supabase_url` y `cors_origins` como campos extra) — el fix de `config.py` es necesario y correcto en su motivación |
+| EN-INFO-02 | INFO | Confirmado: los 4 endpoints (`/auth/login`, `/auth/register`, `/work/claim`, `/work/{chunk_id}/submit`) están efectivamente enganchados al rate limiting en los routers, no solo la infraestructura sin usar |
+| EN-INFO-03 | INFO | Confirmado: el gate de cobertura del 80% (60.33% real, reproducido) es deuda preexistente, no introducida ni empeorada por este ciclo — ver EN-INFO-03 abajo para el desglose |
+
+---
+
+### EN-CRIT-01 — Normalización de email en login sin migración de backfill: riesgo real de bloqueo de cuentas ya existentes
+
+**Archivo:** `backend/app/models/auth.py` (`LoginRequest.email_normalize`, `RegisterRequest.email_format_strict`)
+**Archivo relacionado:** `migrations/001_schema.sql` línea 51 (`CONSTRAINT providers_email_unique UNIQUE (email)` — texto plano, sin `citext`, sin índice `lower(email)`); `migrations/008_rate_limiting.sql` (no incluye ningún backfill)
+
+**Descripción:** El fix de QA es correcto en su lógica hacia adelante: `RegisterRequest` ahora normaliza a minúsculas antes de guardar, y `LoginRequest` normaliza a minúsculas antes de buscar, así que una cuenta creada **a partir de este despliegue** es consistente. El problema es hacia atrás: antes de este ciclo, `RegisterRequest` **no** normalizaba el email, así que cualquier cuenta ya registrada con algún carácter en mayúscula (p. ej. `Ana@Example.com`) tiene ese valor exacto guardado en `providers.email`, en una columna `text` plana con `UNIQUE` case-sensitive (sin `citext`, confirmado en `migrations/001_schema.sql`). Tras este fix, si esa misma persona inicia sesión escribiendo su email exactamente como lo hacía siempre (con las mayúsculas originales, el caso más común), `LoginRequest.email_normalize` lo convierte a minúsculas antes de la búsqueda — pero `get_provider_by_email` hace un `.eq("email", email)` exacto contra un valor que en la BD sigue en mayúsculas. La búsqueda falla y el usuario recibe "Credenciales incorrectas" en una cuenta que hasta ayer funcionaba perfectamente. Es la regresión inversa exacta del bug que este ciclo se propuso arreglar.
+
+No hay ninguna migración en `migrations/008_rate_limiting.sql` (ni en ningún otro fichero de este ciclo) que haga `UPDATE providers SET email = lower(email) WHERE email <> lower(email)`. Verifiqué que el `.env` de este repo apunta a un proyecto Supabase real con datos reales (los 2 tests skip de `test_integration_reliability_v3.py` documentan explícitamente "4 chunk(s) en estado pending/assigned ajenos a este test — jobs reales en curso"), así que no se puede asumir que la tabla `providers` esté vacía o sea solo de seed (el seed de `003_seed.sql` sí está en minúsculas, pero eso no dice nada sobre cuentas reales creadas después del seed y antes de este fix).
+
+**Por qué el test de QA no lo detecta:** `test_login_case_insensitive_email_matches_registered_account` en `backend/tests/test_auth.py` simula el escenario correcto (registro en mayúsculas → login en mayúsculas) pero lo hace mockeando `get_provider_by_email` para devolver directamente `mock_provider` (cuyo email de fixture ya está en minúsculas) cuando el email de búsqueda coincide en minúsculas — es decir, el test verifica la lógica de normalización en el vacío, no el caso real de una fila ya persistida con mayúsculas antes del fix. Es un test válido para el caso "iba a fallar hacia adelante", pero no para el caso "cuentas ya existentes con email en mayúsculas", que es justo el que puede romperse.
+
+**Impacto:** Cualquier proveedor que se registró antes de este despliegue con al menos un carácter en mayúscula en su email pierde acceso a su cuenta la próxima vez que inicie sesión de la forma habitual. No hay mensaje de error que lo explique (recibe el mismo "Credenciales incorrectas" genérico que un password erróneo), por lo que probablemente se reporte como soporte/bug, no como algo autodiagnosticable por el usuario.
+
+**Fix sugerido:** Antes de desplegar este ciclo a producción, añadir una migración `009_normalize_provider_emails.sql`:
+```sql
+UPDATE providers SET email = lower(email) WHERE email <> lower(email);
+```
+Revisar previamente si esto genera colisiones con la constraint `UNIQUE (email)` (dos cuentas que solo difieren en mayúsculas, p. ej. `Ana@x.com` y `ana@x.com` ambas ya registradas) — si las hay, es una decisión de producto/soporte (fusionar, contactar al usuario, etc.), no algo que la migración pueda resolver automáticamente. Sin este paso, el fix del bug de login introduce una regresión equivalente para un subconjunto desconocido de cuentas ya existentes.
+
+---
+
+### EN-MAYOR-01 — `extra="ignore"` cambia el comportamiento por defecto de `pydantic-settings` y puede ocultar un typo de configuración en producción
+
+**Archivo:** `backend/app/core/config.py`, líneas 22–35
+
+**Descripción:** Confirmé en el entorno (`pydantic_settings.BaseSettings.model_config`) que el valor por defecto de `extra` en `BaseSettings` es `"forbid"`, no `"ignore"` — este cambio no es neutral, invierte una protección activa. Antes de este PR, cualquier variable no reconocida en `.env` (typo, variable obsoleta) hacía que `Settings()` lanzara `ValidationError` en el arranque: un fallo alto, ruidoso, imposible de ignorar en logs de despliegue. Reproduje esto exactamente: revirtiendo `config.py` a su versión anterior y ejecutando la suite contra el `backend/.env` real del repo, `Settings()` falla con **tres** errores simultáneos — `supabase_url` requerido faltante, `﻿supabase_url` como campo extra (el BOM), y `cors_origins` como campo extra (variable obsoleta/no usada por ningún campo de `Settings`). Los dos primeros justifican de sobra el fix del BOM; el motivo real y documentado del `extra="ignore"` es el tercero.
+
+El trade-off que pide el encargo: los campos de `Settings` con valor por defecto (`jwt_algorithm`, `jwt_expire_days`, `frontend_url`, y en particular `environment`) **no fallan si faltan** — solo fallarían con `extra="forbid"` si el nombre de la variable en el entorno real no coincide exactamente (case-insensitive) con ninguno de los campos declarados. Con `extra="ignore"`, un typo como `ENVIRONEMNT=production` (en vez de `ENVIRONMENT=production`) en el entorno de despliegue ya no se detecta en absoluto: `Settings()` no falla, `environment` se queda silenciosamente en su valor por defecto `"development"`, y `is_production` (`app/core/config.py` línea 39) evalúa `False`. Confirmé en `app/main.py` (líneas 24, 37–39, 100–104) que `is_production` controla directamente si `/docs`, `/redoc` y `/openapi.json` quedan expuestos y el nivel de logging — es decir, el typo silencioso empuja el sistema exactamente hacia el lado menos seguro (documentación de API expuesta, logs más verbosos) en lo que se creía un despliegue de producción, sin ninguna señal de alarma.
+
+**Impacto:** Bajo probabilidad (requiere un typo específico en una variable de entorno de despliegue), pero impacto alto y completamente silencioso si ocurre — nadie se entera hasta que alguien navegue a `/docs` en producción y lo note, o hasta una auditoría posterior.
+
+**Fix sugerido:** No revertir `extra="ignore"` sin más (rompería el problema real de `CORS_ORIGINS`), pero mitigar el riesgo: usar `extra="allow"` en vez de `"ignore"` y añadir, en el arranque de `app/main.py` (o en `get_settings()`), un `logger.warning` si `Settings().model_extra` no está vacío, listando las claves ignoradas — así se recupera visibilidad (en logs, no como fallo duro) sin volver a un `forbid` que rompería con `CORS_ORIGINS` u otras variables obsoletas legítimas. Alternativa más simple: eliminar `CORS_ORIGINS` del `.env` real (parece no usarse en ningún sitio del código — `grep` no encontró ninguna referencia) y evaluar si `extra="forbid"` puede mantenerse ahora que la causa conocida ya no existiría.
+
+---
+
+### EN-MAYOR-02 — Rate limiting añade una dependencia de conexión directa nueva a `/auth/login` y `/auth/register`, sin manejo de errores
+
+**Archivo:** `backend/app/core/rate_limit.py`, líneas 36–57
+**Archivo relacionado:** `backend/app/db/queries/auth_queries.py` (usa `get_supabase()` — SDK REST, no psycopg2)
+
+**Descripción:** `docs/04-arquitectura.md` §15.0 justifica el coste de una conexión psycopg2 nueva por petición diciendo que para `/auth/login` y `/auth/register` "esto es marginal (ya hacen al menos una consulta a `providers` en el mismo request)". Verifiqué `auth_queries.py`: esa consulta a `providers` se hace vía `get_supabase().table("providers")...` — el SDK REST de Supabase (PostgREST), una ruta de red y de disponibilidad completamente distinta de una conexión psycopg2 directa al pooler en el puerto 6543. Antes de este ciclo, `/auth/login` y `/auth/register` **no tenían ninguna dependencia de psycopg2** — solo del REST de Supabase. Este ciclo introduce, por primera vez, una dependencia dura de conexión directa a Postgres en el camino crítico de autenticación pública.
+
+Además, `check_rate_limit` no envuelve `psycopg2.connect(...)` ni las sentencias en ningún `try/except`: si el pooler está momentáneamente inalcanzable, saturado, o hay un fallo de red puntual entre el proceso Uvicorn y Supabase, la excepción de psycopg2 se propaga sin control hasta el `generic_exception_handler` de `app/main.py`, devolviendo un 500 a **todas** las peticiones de login/registro — aunque el REST de Supabase, que es lo único de lo que dependían antes, esté perfectamente sano. Es decir: el rate limiting, pensado para *proteger* estos endpoints, puede convertirse en su punto único de fallo si el pooler tiene un problema transitorio que no afecta al resto del sistema.
+
+Nota: confirmé que este patrón de "sin `try/except` alrededor de `psycopg2.connect`" ya es consistente con el resto del proyecto (`compute_queries.py` tiene el mismo estilo en sus 4 usos de `psycopg2.connect`) — no es una desviación de estilo introducida por este módulo, pero sí es la primera vez que ese perfil de riesgo alcanza a los endpoints de autenticación pública.
+
+**Impacto:** Un incidente de disponibilidad en el pooler de Postgres (no en el REST de Supabase) ahora también tumba login y registro, que antes eran independientes de esa ruta. Bajo probabilidad, pero cambia el radio de impacto de cualquier incidente futuro del pooler.
+
+**Fix sugerido:** Envolver `check_rate_limit` en un `try/except psycopg2.Error`, y decidir explícitamente la política de fallo: "fail-open" (si el rate limiter no puede consultar Postgres, dejar pasar la petición sin contar, solo logueando un warning) es razonablemente defendible aquí porque el propósito es mitigar abuso, no garantizar corrección financiera — preferible a que un problema de infraestructura tumbe login/registro por completo. Documentar la decisión en `docs/04-arquitectura.md` §15 explícitamente, ya que hoy el documento no contempla este modo de fallo en absoluto.
+
+---
+
+### EN-MENOR-01 — `check_rate_limit` no cierra explícitamente la conexión psycopg2
+
+**Archivo:** `backend/app/core/rate_limit.py`, líneas 37–57
+
+**Descripción:** `with psycopg2.connect(settings.supabase_db_url) as conn:` usa la conexión como gestor de contexto. En psycopg2, esto hace commit (o rollback si hay excepción) del bloque, pero **no cierra la conexión** al salir del `with` — es un comportamiento documentado y bien conocido de la librería (a diferencia de un archivo o socket normal). El código además llama a `conn.commit()` explícitamente dentro del bloque, y nunca a `conn.close()`. En CPython, al salir de la función `check_rate_limit`, el refcounting hace que `conn` se destruya y su `__del__` cierre el socket subyacente — así que en la práctica, hoy, con CPython, no hay fuga de conexiones. Pero es un comportamiento implícito del que depende el código sin declararlo: no es portable a otras implementaciones de Python con GC no determinista, y es frágil ante cualquier refactor futuro que guarde una referencia a `conn` más allá del scope de la función (p. ej., para logging de diagnóstico, para reintentos, etc.), momento en el que empezaría a acumular conexiones abiertas silenciosamente.
+
+**Impacto:** Ninguno hoy (confirmado que CPython lo cierra por refcounting), pero es deuda técnica frágil en una función que se invoca en cada petición a 4 endpoints.
+
+**Fix sugerido:** `try/finally` explícito con `conn.close()`, o usar `psycopg2.pool` si se aborda el pooling de conexiones que ya está señalado como deuda general del proyecto (§14.4.2 de `docs/04-arquitectura.md`, A-06/M-07 de revisiones anteriores).
+
+---
+
+### EN-MENOR-02 — El test de timeout del sandbox no ejercita un bucle infinito genuino; caracterización de QA no coincide con la suite automatizada
+
+**Archivo:** `backend/tests/test_worker.py`, líneas 121–147 (`test_run_chunk_sandboxed_aborts_cleanly_on_timeout`)
+
+**Descripción:** El único test relacionado con el timeout del sandbox reduce `CHUNK_TIMEOUT_SECONDS` a `0` vía `monkeypatch` y confirma que `run_chunk_sandboxed` devuelve un error de timeout — pero, como el propio docstring del test reconoce honestamente, esto funciona porque el arranque del subproceso (`spawn` + import + dispatch) ya tarda más que un presupuesto de 0 segundos, no porque se esté interrumpiendo un cómputo realmente en marcha dentro de un bucle infinito. No hay ningún test en el repo (`grep` de `while True`, `while 1`, `time.sleep` largo no encontró nada) que arranque un plugin que efectivamente se cuelgue y verifique que `proc.terminate()`/`proc.kill()` lo interrumpen a mitad de ejecución.
+
+Esto no coincide con la descripción del encargo de QA ("timeout real del sandbox — bucle infinito genuino, no mockeado") para la suite automatizada que corre en CI; probablemente QA verificó esto manualmente con un script ad-hoc fuera del repo, lo cual es válido como verificación puntual pero no deja ninguna regresión automatizada para el futuro. Analicé el mecanismo en sí (no solo el test) y no encontré motivo para dudar de que funcionaría correctamente contra un bucle infinito real: `proc.terminate()` envía `SIGTERM`, cuya disposición por defecto en un proceso Python sin manejador instalado es terminar el proceso inmediatamente a nivel de kernel, sin depender de que el intérprete llegue a un punto de comprobación de señales — así que un `while True: pass` puro sí sería interrumpido correctamente. El problema es de **cobertura de test**, no de corrección del mecanismo.
+
+Relacionado: las líneas 88–89 (`proc.exitcode != 0`, el camino de OOM/RLIMIT vía SIGKILL/SIGSEGV) y 94–95, 99–100 (cola vacía / resultado con error) de `sandbox.py` aparecen como no cubiertas en el reporte de cobertura (`app\worker\sandbox.py … 57% … Missing 34-59, 88-89, 94-95, 99-100`) — son exactamente los caminos que este módulo existe para manejar (agotamiento de memoria, límite de CPU) y no tienen ningún test, ni siquiera simulado.
+
+**Impacto:** Ninguno funcional confirmado (el mecanismo de timeout es correcto por análisis), pero es una brecha real en la red de seguridad de regresión: si un futuro cambio rompe el manejo de `proc.exitcode != 0` o el timeout real bajo carga, ningún test lo detectaría.
+
+**Fix sugerido:** Añadir un test con un plugin de prueba (o un `job_type` de test registrado ad-hoc) que efectivamente ejecute `while True: pass` o `time.sleep(CHUNK_TIMEOUT_SECONDS * 10)`, con el timeout real (o reducido a 1-2s vía monkeypatch, no a 0) para verificar la interrupción de un cómputo realmente en marcha. Añadir también un test que fuerce `proc.exitcode` distinto de 0 (p. ej. un plugin de prueba que haga `os._exit(1)` o similar) para cubrir esa rama explícitamente.
+
+---
+
+### EN-INFO-03 — Confirmado: el 60.33% de cobertura es deuda preexistente, no introducida por este ciclo
+
+**Descripción:** Ejecuté `pytest --cov=app --cov-report=term-missing` de forma independiente y reproduje exactamente el resultado de QA: **102 passed, 2 skipped, cobertura total 60.33%** (los 2 skip son de `test_integration_reliability_v3.py`, de un ciclo anterior, no relacionados con este). Para confirmar si este ciclo empeoró la cifra, no me limité a asumir la palabra de QA: aislé la contribución de los dos ficheros nuevos de este ciclo al total —
+
+- `app/core/rate_limit.py`: 38 sentencias, **100% cubierto** (0 missing)
+- `app/worker/sandbox.py`: 53 sentencias, 57% cubierto (23 missing — ver EN-MENOR-02)
+
+Excluyendo ambos del cálculo, la cobertura del resto del proyecto sería (1719-38-53 stmts, 682-0-23 miss) ≈ **59.5%** — es decir, prácticamente idéntica al 60.33% con ellos incluidos. Los ficheros nuevos de este ciclo, en conjunto, **suman** puntos de cobertura (no restan), porque `rate_limit.py` quedó completamente cubierto. `app/worker/main.py` (30% cubierto) parte de una base de **0% antes de este ciclo** — `docs/04-estructura.md` y el propio `docs/04-arquitectura.md` §15.8 confirman que no existía ningún test de `app/worker/` antes; `test_worker.py` es un fichero nuevo de este mismo ciclo — así que su cifra actual es una mejora, no un empeoramiento.
+
+Los módulos que realmente arrastran el promedio por debajo del 80% son todos preexistentes y ninguno fue tocado en este ciclo: `app/db/queries/client_queries.py` (14%), `app/db/queries/task_queries.py` (19%), `app/services/client_service.py` (20%), `app/db/queries/compute_queries.py` (24%), `app/db/queries/profile_queries.py` (35%), `app/worker/plugins/data_processing.py` (36%), `app/services/compute_service.py` (43%), `app/db/queries/wallet_queries.py` (45%). Confirmo la afirmación de QA: el fallo del gate de cobertura es deuda preexistente de ciclos anteriores (features de cliente, cómputo, wallet), no algo introducido ni agravado por el endurecimiento de seguridad de este ciclo.
+
+**Recomendación (no bloqueante para este ciclo):** el gate `--cov-fail-under=80` seguirá fallando en cada PR mientras esos módulos preexistentes no se aborden — vale la pena que el Product Owner decida si se baja el umbral temporalmente (con un ticket de deuda técnica explícito) o se prioriza un ciclo dedicado a tests de la capa `db/queries` y `services` de client/compute/wallet, para que el gate deje de ser ruido ignorado en cada ciclo.
+
+---
+
+### Resumen ejecutivo de esta revisión
+
+| Severidad | Cantidad | IDs |
+|-----------|----------|-----|
+| CRÍTICO   | 1        | EN-CRIT-01 |
+| MAYOR     | 2        | EN-MAYOR-01, EN-MAYOR-02 |
+| MENOR     | 2        | EN-MENOR-01, EN-MENOR-02 |
+| INFO      | 3        | EN-INFO-01, EN-INFO-02, EN-INFO-03 |
+| **Total** | **8**    | |
+
+**Sobre las 4 mejoras del encargo:** las cuatro están bien diseñadas conceptualmente y `docs/04-arquitectura.md` §15 es, en general, honesto sobre sus límites (documenta explícitamente lo que deja fuera de alcance en §15.3.5, §15.4.2, §15.5). El rate limiting es atómico y correcto bajo concurrencia (verifiqué la semántica del `UPSERT ... ON CONFLICT ... RETURNING`, que serializa correctamente vía la constraint única de Postgres). El sandboxing del worker aísla correctamente el proceso principal de un chunk colgado (verificado por análisis del mecanismo de señales, no solo por el test, que tiene una brecha real — EN-MENOR-02). Las credenciales del worker por entorno son un diseño de deprecación razonable y bien implementado, con test de precedencia correcto. El fix del BOM/`CORS_ORIGINS` es necesario y lo reproduje de forma independiente.
+
+**Lo que sí es un problema real:** el propio bug de login que QA encontró y Backend Dev corrigió introduce, por el camino, un riesgo de regresión inversa (EN-CRIT-01) para cualquier cuenta ya existente con email en mayúsculas, porque el fix no vino acompañado de una migración de backfill — y el test end-to-end de QA no lo habría detectado porque mockea la búsqueda en vez de ejercitar el escenario de una fila ya persistida con mayúsculas. Este es el hallazgo que más me preocupa de todo el ciclo, precisamente porque nace de arreglar un bug real de forma incompleta.
+
+**Veredicto:** No aprobado sin resolver EN-CRIT-01 antes de desplegar a producción. Los hallazgos MAYOR (EN-MAYOR-01, EN-MAYOR-02) no son bloqueantes para mergear pero deben decidirse explícitamente (no dejarse como omisión silenciosa) antes del lanzamiento público que motivó este ciclo. Confirmo la honestidad del reporte de QA en cuanto a la cobertura del 80% (EN-INFO-03): es deuda preexistente, tal como QA sospechaba.
+
+---
+
+### Handoff al Security Auditor — ciclo Endurecimiento de Seguridad Pre-Lanzamiento
+
+1. **EN-CRIT-01 (máxima prioridad):** antes de dar luz verde al lanzamiento público, confirmar con el Database Engineer si existen ya cuentas reales en `providers` con email en mayúsculas, y si la migración de backfill (`UPDATE providers SET email = lower(email)...`) se ha planificado o ejecutado. Esto puede ser, en la práctica, el hallazgo de mayor impacto de usuario de todo este ciclo si el proyecto ya tiene usuarios reales registrados.
+2. **EN-MAYOR-01 (`extra="ignore"`):** revisar junto al Database Engineer/DevOps qué variables de entorno reales existen en cada entorno de despliegue (Vercel/Railway/Supabase, según `docs/04-estructura.md`) para confirmar que no hay ya un typo silencioso en `ENVIRONMENT` u otro campo con valor por defecto. Sugiero exigir, como parte del checklist de despliegue, un chequeo manual explícito de `GET /health` en producción para confirmar `environment: "production"` en la respuesta (el endpoint ya expone ese campo, `app/main.py` línea 104).
+3. **EN-MAYOR-02 (nueva dependencia de psycopg2 en auth):** evaluar si el perfil de disponibilidad del pooler de Supabase (puerto 6543) ya fue objeto de un análisis de SLA/rate limits propio de Supabase — si el pooler tiene límites de conexión más agresivos que el REST de Supabase, esto podría convertirse en el cuello de botella real bajo un pico de tráfico legítimo (no solo un ataque), afectando login/registro de usuarios genuinos.
+4. **Sybil (§15.4 del diseño):** confirmar que el Product Owner es consciente, de forma explícita, de que esta mitigación es cosmética frente a un atacante con más de una IP — el propio `docs/04-arquitectura.md` §15.4.3 ya lo admite honestamente, pero vale la pena que quede como decisión de riesgo aceptado firmada, no solo documentada, antes de un lanzamiento público.
+5. Todo lo señalado en los handoffs de seguridad de los ciclos anteriores (incluyendo el de Estabilidad v3, arriba) sigue vigente y no se ha vuelto a tocar en este ciclo.

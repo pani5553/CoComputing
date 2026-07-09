@@ -1,7 +1,13 @@
 """
 Co-Computing Worker — standalone process that polls the API and processes chunks.
 
-Usage:
+Usage (recommended — credentials via environment, never visible in `ps aux`
+or shell history, see docs/04-arquitectura.md §15.2):
+    export CC_WORKER_EMAIL=worker@example.com
+    export CC_WORKER_PASSWORD=secret123
+    python -m app.worker --api http://localhost:8000 [--max-chunks 3] [--interval 5]
+
+Usage (deprecated — kept for backwards compatibility, emits a warning):
     python -m app.worker \
         --api http://localhost:8000 \
         --email worker@example.com \
@@ -9,20 +15,23 @@ Usage:
         [--max-chunks 3] \
         [--interval 5]
 
-SECURITY NOTE: The worker executes payloads from the server without sandboxing.
-Payloads are restricted to tabular data (lists of lists); no eval/exec is used.
-Do NOT run this worker against untrusted API endpoints in production without
-adding proper isolation (Docker seccomp, AppArmor, etc.).
+SECURITY NOTE: chunk processing runs inside a sandboxed subprocess with a
+hard timeout and CPU/memory limits (see app/worker/sandbox.py) — this is a
+first step, not full container/seccomp isolation. Do NOT run this worker
+against untrusted API endpoints in production without adding proper
+isolation (Docker seccomp, AppArmor, etc.) if a future plugin invokes
+external binaries.
 """
 import argparse
 import logging
+import os
 import sys
 import time
 from typing import Any
 
 import httpx
 
-from app.worker.plugins import get_plugin
+from app.worker.sandbox import run_chunk_sandboxed
 
 logging.basicConfig(
     level=logging.INFO,
@@ -93,25 +102,14 @@ def submit_result(api: str, headers: dict, chunk_id: str, result: dict, duration
 
 def process_chunk(chunk: dict) -> tuple[dict, int]:
     """
-    Dispatch the chunk payload to the appropriate plugin.
-    Returns (result_dict, duration_ms).
+    Dispatch the chunk payload to the appropriate plugin, running it inside
+    an isolated subprocess (see app/worker/sandbox.py) so that a pathological
+    payload (hang, runaway memory/CPU) cannot take down the worker process
+    itself. Returns (result_dict, duration_ms).
     """
     job_type = chunk.get("job_type", "data-processing")
     payload = chunk.get("payload", {})
-
-    plugin = get_plugin(job_type)
-    if plugin is None:
-        logger.error("Tipo de job no soportado por este worker: %s", job_type)
-        return {"error": f"unsupported job_type: {job_type}"}, 1
-
-    start = time.monotonic()
-    try:
-        result = plugin.process(payload)
-    except Exception as exc:
-        logger.error("Error procesando chunk: %s", exc, exc_info=True)
-        result = {"error": str(exc)}
-    elapsed_ms = max(1, int((time.monotonic() - start) * 1000))
-    return result, elapsed_ms
+    return run_chunk_sandboxed(job_type, payload)
 
 
 def run_worker(api: str, email: str, password: str, max_chunks: int, interval: int) -> None:
@@ -157,13 +155,57 @@ def run_worker(api: str, email: str, password: str, max_chunks: int, interval: i
             submit_result(api, headers, chunk_id, result, duration_ms)
 
 
+def resolve_worker_credentials(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> tuple[str, str]:
+    """
+    Resuelve email y password del worker.
+    Prioridad: variables de entorno CC_WORKER_EMAIL / CC_WORKER_PASSWORD
+    (recomendado) sobre los argumentos --email/--password (deprecados,
+    visibles en `ps aux` y en el historial de shell — SEC-20).
+
+    Lanza parser.error(...) (SystemExit) si, tras aplicar la precedencia,
+    falta el email o el password.
+    """
+    email = os.environ.get("CC_WORKER_EMAIL") or args.email
+    password = os.environ.get("CC_WORKER_PASSWORD") or args.password
+
+    if args.password and not os.environ.get("CC_WORKER_PASSWORD"):
+        logger.warning(
+            "DEPRECADO: --password expone la contraseña en `ps aux` y el historial de "
+            "shell (SEC-20). Usa la variable de entorno CC_WORKER_PASSWORD. "
+            "El argumento --password se eliminará en una futura versión."
+        )
+
+    if args.email and not os.environ.get("CC_WORKER_EMAIL"):
+        logger.warning(
+            "DEPRECADO: --email debería pasarse vía CC_WORKER_EMAIL. "
+            "El argumento --email se conservará, pero se recomienda migrar."
+        )
+
+    if not email or not password:
+        parser.error(
+            "Credenciales requeridas: define CC_WORKER_EMAIL y CC_WORKER_PASSWORD "
+            "(recomendado) o usa --email/--password (deprecado)."
+        )
+    return email, password
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Co-Computing Worker — procesa chunks distribuidos"
     )
     parser.add_argument("--api", default="http://localhost:8000", help="URL base de la API")
-    parser.add_argument("--email", required=True, help="Email del proveedor/worker")
-    parser.add_argument("--password", required=True, help="Contraseña del proveedor/worker")
+    parser.add_argument(
+        "--email",
+        default=None,
+        help="[DEPRECADO] Email del proveedor/worker. Usa CC_WORKER_EMAIL en su lugar.",
+    )
+    parser.add_argument(
+        "--password",
+        default=None,
+        help="[DEPRECADO] Contraseña del proveedor/worker. Usa CC_WORKER_PASSWORD en su lugar.",
+    )
     parser.add_argument(
         "--max-chunks",
         type=int,
@@ -179,10 +221,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    email, password = resolve_worker_credentials(args, parser)
+
     run_worker(
         api=args.api,
-        email=args.email,
-        password=args.password,
+        email=email,
+        password=password,
         max_chunks=args.max_chunks,
         interval=args.interval,
     )

@@ -403,20 +403,28 @@ El fichero `004_compute.sql` es idempotente (`CREATE TABLE IF NOT EXISTS`, `DROP
 
 ### Lanzar un worker
 
-El worker se autentica con las credenciales de un proveedor existente y entra en un bucle de claim-process-submit:
+El worker se autentica con las credenciales de un proveedor existente y entra en un bucle de claim-process-submit.
+
+**Metodo recomendado — variables de entorno:**
 
 ```bash
 cd backend
+export CC_WORKER_EMAIL=tu@email.com
+export CC_WORKER_PASSWORD=tupassword
+python -m app.worker --api http://localhost:8000
+```
+
+**Alternativa en desuso — argumentos CLI** (`--email`/`--password`): siguen funcionando por compatibilidad hacia atras, pero exponen la contrasena en `ps aux` y en el historial de shell, y emiten una advertencia de deprecacion en cada arranque. Si se definen ambos metodos a la vez, la variable de entorno tiene prioridad.
+
+```bash
 python -m app.worker --api http://localhost:8000 --email tu@email.com --password tupassword
 ```
 
-Parametros obligatorios:
-
-| Parametro | Descripcion |
+| Parametro / Variable | Descripcion |
 |-----------|-------------|
 | `--api` | URL base del backend (sin trailing slash) |
-| `--email` | Email del proveedor registrado en la plataforma |
-| `--password` | Contrasena del proveedor |
+| `CC_WORKER_EMAIL` (recomendado) / `--email` (en desuso) | Email del proveedor registrado en la plataforma |
+| `CC_WORKER_PASSWORD` (recomendado) / `--password` (en desuso) | Contrasena del proveedor |
 
 El worker hace polling a `POST /work/claim` cada 5 segundos si no hay chunks disponibles. Se detiene con `Ctrl+C`.
 
@@ -439,9 +447,11 @@ El script levanta varias instancias del worker en paralelo. Editar el script par
 
 ### Nota de seguridad
 
-**El worker ejecuta computo sin sandboxing.** El proceso Python descarga payloads de la API y los procesa directamente con polars en la maquina del worker. En el MVP, el payload solo contiene datos tabulares (no codigo ejecutable) y la comunicacion es HTTPS con JWT. Sin embargo, si la API o la base de datos fuesen comprometidas, un payload malicioso podria afectar a la maquina del worker.
+**El worker aisla cada chunk en un subproceso separado (desde 2026-07-09).** `plugin.process(payload)` se ejecuta en un subproceso `multiprocessing` con timeout duro de 30 segundos y limites de CPU/memoria (`RLIMIT_CPU`/`RLIMIT_AS`) — un payload que cuelga o agota memoria ya no tumba el proceso worker completo, solo ese chunk.
 
-**Usar el worker unicamente en entornos de confianza para el MVP.** El sandboxing real (contenedor aislado con seccomp/AppArmor, verificacion HMAC del payload, ejecucion sin acceso a red) queda fuera del alcance de esta version y debe implementarse antes de usar el worker en produccion con datos de terceros no confiables.
+**Esto no es sandboxing completo.** El subproceso no tiene aislamiento de red ni de filesystem, no hay namespaces de sistema operativo, y hereda las variables de entorno del proceso padre. En el MVP el payload solo contiene datos tabulares (no codigo ejecutable) y la comunicacion es HTTPS con JWT, pero si la API o la base de datos fuesen comprometidas, un payload malicioso todavia podria intentar exfiltrar datos por red o leer el filesystem del host del worker.
+
+**Usar el worker unicamente en entornos de confianza.** El aislamiento completo (contenedor con seccomp/AppArmor, sin acceso a red saliente salvo la API, filesystem de solo lectura) sigue pendiente y debe implementarse antes de anadir cualquier plugin que invoque binarios externos o de usar el worker en produccion con datos de terceros no confiables. Ver `docs/04-arquitectura.md` §15.3 y `docs/06-security.md` (SEC-29).
 
 ---
 

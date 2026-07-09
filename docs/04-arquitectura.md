@@ -1669,3 +1669,536 @@ def _pay_and_update_trust(provider_id: str, chunk_id: str, valid: bool) -> None:
 
 - **`backend/tests/test_consensus.py`:** los tests que llegan a consenso (K-01, K-03, K-04 — los que hoy mockean `app.services.wallet_service.credit_reward`, `app.db.queries.auth_queries.get_provider_by_id` y `app.db.queries.profile_queries.update_provider`) dejan de ejercitar el código real una vez aplicado este diseño, porque `_pay_and_update_trust` ya no llama a esas tres funciones — deben actualizarse para mockear `app.db.queries.wallet_queries.credit_reward_and_update_trust` en su lugar. Es un cambio mecánico (un mock en vez de tres) pero necesario para que los tests sean honestos.
 - **`claim_chunks_atomic` / `POST /work/claim`:** no tienen tests unitarios hoy (§14.0.7) — no hay nada que romper, pero se recomienda que QA/Backend Dev añadan al menos un test de integración (contra base de datos real de test, siguiendo el patrón "sin mocking de BD" ya usado para `test_compute.py` según §12.9) que cree un chunk `assigned` con `assigned_at` en el pasado y confirme que una llamada a `/work/claim` lo libera y permite que otro proveedor lo reclame. No es un requisito bloqueante de este diseño, es una recomendación a quien lo implemente.
+
+---
+
+## 15. Endurecimiento Pre-Lanzamiento — Rate Limiting, Credenciales del Worker, Aislamiento de Proceso y Mitigación Básica de Sybil
+
+**Fecha:** 2026-07-08
+**Autor:** Software Architect
+**Referencias:** `docs/06-security.md` — SEC-02 y SEC-21 (sin rate limiting en `/auth/login`, `/auth/register`, `/work/claim`), SEC-20 (contraseña del worker en CLI), SEC-29 (worker sin sandbox), SEC-23 (Sybil attack en consenso, del que este ciclo solo cubre la superficie de creación de cuentas, no el problema de fondo del consenso). Encargo del Product Owner: endurecer seguridad antes de un futuro lanzamiento público.
+
+Esta sección diseña 4 mitigaciones concretas, acotadas al alcance real del proyecto hoy: **un único proceso lógico FastAPI/Uvicorn (`--workers 2`, ver `deploy/backend.Dockerfile` línea 37) y Supabase Postgres como único almacén compartido — sin Redis, sin cola de mensajes, sin servicio externo de email.** Cualquier diseño que necesitara uno de esos tres elementos se deja marcado explícitamente como decisión pendiente del usuario (cuenta/servicio externo nuevo, igual que Vercel/Railway/Supabase), no se diseña en detalle. Es aditiva: no modifica §12 ni §14, que siguen vigentes.
+
+### 15.0 Restricción de diseño transversal: `--workers 2` invalida cualquier limitador en memoria de proceso
+
+El `CMD` de `deploy/backend.Dockerfile` arranca `uvicorn ... --workers 2`: **dos procesos Python del sistema operativo, cada uno con su propio heap**, detrás del mismo puerto (Uvicorn/`multiprocessing` reparte las conexiones entrantes entre ambos). Un limitador implementado como diccionario en memoria de proceso (el patrón que sugería originalmente SEC-02/SEC-21 con `slowapi` en su modo por defecto) **no comparte estado entre esos dos procesos** — cada uno contaría las peticiones que le tocan a él, y un atacante que reciba tráfico repartido entre ambos (aleatorio, fuera de su control pero también fuera del control del defensor) dispondría en la práctica de hasta el doble del límite nominal antes de ser bloqueado por cualquiera de los dos procesos individualmente. Para `/auth/login` (fuerza bruta) esto es directamente relevante: un límite nominal de "10/minuto" degradaría a un límite real de hasta "20/minuto" repartido entre procesos.
+
+**Decisión: el contador de rate limiting vive en Postgres, no en memoria de proceso.** Ya existe una conexión psycopg2 directa disponible (`settings.supabase_db_url`, usada hoy por `claim_chunks_atomic`, `wallet_queries`, etc.) — no es una dependencia nueva, es reutilizar el único almacén compartido que el proyecto ya tiene. Se descartan explícitamente:
+
+- **`slowapi` con almacenamiento en memoria (su modo por defecto):** roto por el argumento de arriba con `--workers 2`. `slowapi` sí soporta un backend Redis/Memcached para compartir estado entre procesos, pero eso reintroduce la dependencia externa que este proyecto no tiene.
+- **Redis:** resolvería el problema de forma más eficiente (sin round-trip a Postgres por petición), pero es un servicio nuevo que requeriría alta (cuenta gestionada tipo Upstash/Redis Cloud, o un contenedor adicional en el despliegue). **Se marca explícitamente como fuera de este ciclo — decisión y cuenta externa del usuario**, no se diseña en detalle. Si el proyecto migra a Redis en el futuro por otro motivo (colas, caché), este limitador es el primer candidato a migrar también.
+- **Reducir `--workers` a 1** para que la memoria de proceso vuelva a ser un almacén válido: se descarta por ser un cambio de infraestructura no solicitado y que reduce la capacidad de servir peticiones concurrentes solo para simplificar el rate limiting; el coste de usar Postgres (un round-trip adicional) es aceptable dado el volumen esperado de estos endpoints.
+
+**Trade-off aceptado y documentado:** cada petición rate-limitada abre una conexión psycopg2 nueva (mismo patrón ya usado en todo el proyecto, sin pool — deuda ya señalada en SEC-13). Esto añade un round-trip a Postgres por petición a los 4 endpoints afectados. Para `/auth/login` y `/auth/register` esto es marginal (ya hacen al menos una consulta a `providers` en el mismo request). Para `/work/claim` y `/work/{chunk_id}/submit`, que ya abren su propia conexión psycopg2 para el claim/consenso, esto duplica el número de conexiones psycopg2 por request — se acepta como parte de la misma deuda técnica ya documentada en §14.4.2, no se resuelve aquí; si el volumen de tráfico de estos endpoints creciera lo suficiente para que esto importe, es la señal para priorizar por fin un pool de conexiones (`psycopg2.pool.ThreadedConnectionPool`), no para revertir este diseño.
+
+### 15.1 Decisión 1 — Rate limiting compartido vía Postgres
+
+#### 15.1.1 Endpoints cubiertos y límites elegidos
+
+| Endpoint | Identidad (bucket) | Límite | Ventana | Motivo |
+|---|---|---|---|---|
+| `POST /auth/login` | IP del cliente | 10 peticiones | 60 s | Fuerza bruta / credential stuffing (SEC-02) |
+| `POST /auth/register` | IP del cliente | 5 peticiones | 3600 s (1 hora) | Creación masiva de cuentas (SEC-02 + mitigación Sybil, ver §15.4) — ventana horaria deliberadamente más larga que login, porque el objetivo aquí no es solo el ritmo de intentos sino el volumen de cuentas nuevas por origen |
+| `POST /work/claim` | `provider_id` autenticado | 30 peticiones | 60 s | Acaparamiento de chunks (SEC-21) |
+| `POST /work/{chunk_id}/submit` | `provider_id` autenticado | 60 peticiones | 60 s | Defensa en profundidad simétrica a `/claim`; un worker legítimo nunca necesita más de ~1 submit/segundo sostenido (ver §15.1.5) |
+
+`/work/claim` y `/work/submit` se identifican por `provider_id` (no por IP): varios workers legítimos de la misma organización pueden compartir NAT/IP, y es el criterio que ya usó el propio hallazgo SEC-21 en `docs/06-security.md`. `/auth/login` y `/auth/register` se identifican por IP porque, al ser públicos, todavía no hay ningún `provider_id` autenticado en el momento de la petición.
+
+#### 15.1.2 Esquema nuevo: tabla `rate_limit_counters`
+
+Ventana fija (no sliding window): más simple de implementar de forma atómica con un único `UPSERT`, sin necesitar una estructura de log de eventos. El coste aceptado es el clásico de ventana fija (ráfaga de hasta 2× el límite alrededor del límite de dos ventanas consecutivas) — irrelevante para los límites y objetivos de esta sección (blindar contra automatización sostenida, no contra un pico de un par de peticiones en el borde de la ventana).
+
+```sql
+CREATE TABLE IF NOT EXISTS rate_limit_counters (
+    bucket        text        NOT NULL,
+    window_start  timestamptz NOT NULL,
+    request_count integer     NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket, window_start)
+);
+
+COMMENT ON TABLE rate_limit_counters IS
+    'Contador de peticiones por bucket (scope:tipo:identidad, p.ej. "login:ip:203.0.113.5") y ventana fija, usado por app.core.rate_limit.check_rate_limit. Compartido entre los procesos Uvicorn (--workers 2) vía Postgres porque no hay Redis (ver docs/04-arquitectura.md §15.0). Limpieza perezosa: check_rate_limit borra, con baja probabilidad, las filas de más de 1 hora — no requiere scheduler, mismo patrón que el reclamo perezoso de §14.2.1.';
+```
+
+**Índice:** ninguno adicional — la clave primaria `(bucket, window_start)` ya sirve tanto al `UPSERT` (`ON CONFLICT`) como a la limpieza (`WHERE window_start < ...`, que sobre una tabla pequeña y con poca antigüedad de filas no necesita un índice separado sobre `window_start` en solitario).
+
+**Migración nueva: `migrations/008_rate_limiting.sql`** (siguiente número disponible tras `007_chunk_abandon_tracking.sql`), contenido:
+
+```sql
+-- =============================================================================
+-- Co-Computing — Migration 008: Rate limiting compartido (SEC-02, SEC-21)
+-- PostgreSQL 15 (Supabase)
+-- Ejecutar DESPUÉS de 001_schema.sql .. 007_chunk_abandon_tracking.sql
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS rate_limit_counters (
+    bucket        text        NOT NULL,
+    window_start  timestamptz NOT NULL,
+    request_count integer     NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket, window_start)
+);
+
+COMMENT ON TABLE rate_limit_counters IS
+    'Contador de peticiones por bucket y ventana fija para rate limiting compartido entre procesos Uvicorn. Ver docs/04-arquitectura.md §15.1.';
+```
+
+No requiere RLS: se accede exclusivamente vía conexión psycopg2 directa (`SUPABASE_DB_URL`), nunca vía el SDK REST de Supabase, mismo patrón ya usado por `chunks`/`jobs` para las operaciones atómicas.
+
+#### 15.1.3 Módulo nuevo `app/core/rate_limit.py`
+
+```python
+"""
+Rate limiting compartido entre procesos Uvicorn, respaldado por Postgres
+(no hay Redis disponible en este proyecto — ver docs/04-arquitectura.md §15.0).
+Ventana fija por bucket, atómica vía UPSERT.
+"""
+import logging
+import random
+import time
+from datetime import datetime, timezone
+
+import psycopg2
+from fastapi import Depends, HTTPException, Request, status
+
+from app.core.config import settings
+from app.core.dependencies import get_current_provider
+
+logger = logging.getLogger(__name__)
+
+_CLEANUP_PROBABILITY = 0.01      # 1% de las llamadas hacen limpieza perezosa
+_CLEANUP_MAX_AGE_SECONDS = 3600  # filas de más de 1 hora se consideran basura
+
+
+def _window_start(window_seconds: int) -> datetime:
+    epoch_now = int(time.time())
+    bucket_epoch = (epoch_now // window_seconds) * window_seconds
+    return datetime.fromtimestamp(bucket_epoch, tz=timezone.utc)
+
+
+def check_rate_limit(bucket: str, limit: int, window_seconds: int) -> None:
+    """
+    Incrementa el contador de `bucket` para la ventana fija actual (atómico,
+    vía UPSERT en Postgres) y lanza HTTPException(429) si supera `limit`.
+    Válido entre los N procesos Uvicorn porque el contador vive en la base
+    de datos compartida, no en memoria de proceso (ver §15.0).
+    """
+    window_start = _window_start(window_seconds)
+    with psycopg2.connect(settings.supabase_db_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO rate_limit_counters (bucket, window_start, request_count)
+                VALUES (%s, %s, 1)
+                ON CONFLICT (bucket, window_start)
+                DO UPDATE SET request_count = rate_limit_counters.request_count + 1
+                RETURNING request_count
+                """,
+                (bucket, window_start),
+            )
+            (count,) = cur.fetchone()
+
+            if random.random() < _CLEANUP_PROBABILITY:
+                cur.execute(
+                    "DELETE FROM rate_limit_counters "
+                    "WHERE window_start < now() - make_interval(secs => %s)",
+                    (_CLEANUP_MAX_AGE_SECONDS,),
+                )
+        conn.commit()
+
+    if count > limit:
+        logger.warning("Rate limit excedido: bucket=%s count=%d limit=%d", bucket, count, limit)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Demasiadas peticiones. Inténtalo de nuevo en unos instantes.",
+            headers={"Retry-After": str(window_seconds)},
+        )
+
+
+def _client_ip(request: Request) -> str:
+    """
+    IP real del cliente. Si el backend corre detrás de un proxy reverso,
+    requiere `uvicorn --proxy-headers` (ya señalado en el checklist de
+    despliegue de docs/06-security.md) para que `request.client.host`
+    refleje la IP real y no la del proxy.
+    """
+    return request.client.host if request.client else "unknown"
+
+
+def rate_limit_by_ip(scope: str, limit: int, window_seconds: int):
+    """Factory de dependencia FastAPI para endpoints públicos, keyed por IP."""
+    def _dependency(request: Request) -> None:
+        check_rate_limit(f"{scope}:ip:{_client_ip(request)}", limit, window_seconds)
+    return _dependency
+
+
+def rate_limit_by_provider(scope: str, limit: int, window_seconds: int):
+    """
+    Factory de dependencia FastAPI para endpoints autenticados, keyed por
+    provider_id. Sustituye a Depends(get_current_provider) en el endpoint
+    (internamente lo llama y devuelve el provider) — no hace falta declarar
+    ambas dependencias por separado.
+    """
+    def _dependency(provider: dict = Depends(get_current_provider)) -> dict:
+        check_rate_limit(f"{scope}:provider:{provider['id']}", limit, window_seconds)
+        return provider
+    return _dependency
+```
+
+#### 15.1.4 Enganche en los routers (dependency de FastAPI, no middleware global)
+
+Se implementa como **dependencia de FastAPI por endpoint**, no como middleware global de `app.main`: los 4 endpoints afectados tienen identidades de bucket distintas (IP vs `provider_id`) y límites distintos: una dependencia explícita por ruta es más legible y auditable que un middleware con lógica condicional por path, y sigue el patrón de capas ya establecido en este proyecto (routers declaran sus `Depends(...)` explícitamente, ver §2.1).
+
+```python
+# app/routers/auth.py — añadir import y decorar los dos endpoints públicos
+from app.core.rate_limit import rate_limit_by_ip
+
+@router.post(
+    "/register",
+    response_model=ProviderPublic,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(rate_limit_by_ip("register", limit=5, window_seconds=3600))],
+)
+def register(payload: RegisterRequest) -> ProviderPublic:
+    ...
+
+@router.post(
+    "/login",
+    response_model=TokenResponse,
+    dependencies=[Depends(rate_limit_by_ip("login", limit=10, window_seconds=60))],
+)
+def login(payload: LoginRequest) -> TokenResponse:
+    ...
+```
+
+```python
+# app/routers/work.py — sustituir Depends(get_current_provider) por la variante con rate limit
+from app.core.rate_limit import rate_limit_by_provider
+
+@router.post("/claim", response_model=ClaimResponse)
+def claim_chunks(
+    body: ClaimRequest,
+    provider: dict = Depends(rate_limit_by_provider("work_claim", limit=30, window_seconds=60)),
+) -> ClaimResponse:
+    ...  # sin cambios en el cuerpo: `provider` sigue siendo el dict del provider autenticado
+
+@router.post("/{chunk_id}/submit", response_model=SubmitResponse)
+def submit_chunk(
+    chunk_id: UUID,
+    body: SubmitRequest,
+    provider: dict = Depends(rate_limit_by_provider("work_submit", limit=60, window_seconds=60)),
+) -> SubmitResponse:
+    ...  # sin cambios en el cuerpo
+```
+
+No se usa `dependencies=[...]` (parámetro de solo-efecto-secundario) en `/work/claim` y `/work/submit` porque ambos endpoints ya necesitan el `dict` del provider devuelto por la dependencia para su lógica; en `/auth/register` y `/auth/login` sí se usa esa forma porque no hay ningún provider autenticado que inyectar (son públicos).
+
+#### 15.1.5 Respuesta 429 y por qué esos límites
+
+`429 Too Many Requests` con `{"detail": "Demasiadas peticiones. Inténtalo de nuevo en unos instantes."}` y cabecera `Retry-After: <window_seconds>` — consistente con el estilo de mensajes en español ya usado en todo `docs/04-api-contracts.md` (ver Convenciones globales, actualizado en §1.7 de ese documento).
+
+Justificación de los límites: `/work/claim` con `max_chunks` hasta 10 (`ClaimRequest.max_chunks`) y 30 llamadas/minuto permite hasta 300 chunks/minuto por proveedor en el caso legítimo de mayor consumo — muy por encima de lo que un worker real (`--interval 5` por defecto, ver `worker/main.py`) necesita en operación normal (como mucho 12 llamadas/minuto con el intervalo por defecto), pero suficientemente bajo para frenar un bucle cerrado de reclamo. `/work/submit` se fija en el doble (60/min) porque, a diferencia del claim, cada submit corresponde a un chunk ya entregado por el propio worker — el ritmo natural de submits nunca debería acercarse a ese límite salvo automatización deliberada.
+
+### 15.2 Decisión 2 — Credenciales del worker por variable de entorno
+
+#### 15.2.1 Diseño elegido
+
+Nuevas variables de entorno **`CC_WORKER_EMAIL`** y **`CC_WORKER_PASSWORD`** (prefijo `CC_` para namespacing, evita colisión con variables genéricas `WORKER_*` que pudiera definir el orquestador de despliegue). Se leen con `os.environ.get(...)`, no vía `pydantic-settings` (el worker es un script standalone, no la app FastAPI — no comparte `Settings`).
+
+**Criterio de compatibilidad — deprecación explícita, no ruptura inmediata:** `--email`/`--password` dejan de ser `required=True` y pasan a ser opcionales; si se usan, siguen funcionando pero emiten un `logger.warning` de deprecación en cada arranque. Se elige deprecar en vez de eliminar de golpe porque `run_workers.sh` y cualquier script de despliegue ya existente que invoque el worker con `--password` no debe romperse en este mismo ciclo — coherente con el criterio de "aditivo, no disruptivo" ya aplicado en el resto de este documento (§12, §14). **Plan de eliminación:** el argumento `--password` se retira en la siguiente iteración mayor del worker una vez confirmado que ningún script de despliegue lo usa ya (a verificar por DevOps antes de ese corte); `--email` puede conservarse indefinidamente como argumento (no es un secreto, solo un identificador), a diferencia de `--password`.
+
+**Precedencia:** variable de entorno gana si ambas están presentes (evita que un valor accidental en el historial de shell o en un script viejo sobrescriba silenciosamente la config correcta del entorno).
+
+#### 15.2.2 Cambios en `backend/app/worker/main.py`
+
+```python
+import os
+# ... resto de imports sin cambios
+
+def resolve_worker_credentials(args: argparse.Namespace, parser: argparse.ArgumentParser) -> tuple[str, str]:
+    """
+    Resuelve email y password del worker.
+    Prioridad: variables de entorno CC_WORKER_EMAIL / CC_WORKER_PASSWORD
+    (recomendado) sobre los argumentos --email/--password (deprecados,
+    visibles en `ps aux` y en el historial de shell — SEC-20).
+    """
+    email = os.environ.get("CC_WORKER_EMAIL") or args.email
+    password = os.environ.get("CC_WORKER_PASSWORD") or args.password
+
+    if args.password and not os.environ.get("CC_WORKER_PASSWORD"):
+        logger.warning(
+            "DEPRECADO: --password expone la contraseña en `ps aux` y el historial de "
+            "shell (SEC-20). Usa la variable de entorno CC_WORKER_PASSWORD. "
+            "El argumento --password se eliminará en una futura versión."
+        )
+
+    if not email or not password:
+        parser.error(
+            "Credenciales requeridas: define CC_WORKER_EMAIL y CC_WORKER_PASSWORD "
+            "(recomendado) o usa --email/--password (deprecado)."
+        )
+    return email, password
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Co-Computing Worker — procesa chunks distribuidos"
+    )
+    parser.add_argument("--api", default="http://localhost:8000", help="URL base de la API")
+    parser.add_argument(
+        "--email", default=None,
+        help="[DEPRECADO] Email del worker. Usa CC_WORKER_EMAIL en su lugar.",
+    )
+    parser.add_argument(
+        "--password", default=None,
+        help="[DEPRECADO] Password del worker. Usa CC_WORKER_PASSWORD en su lugar.",
+    )
+    parser.add_argument("--max-chunks", type=int, default=3, dest="max_chunks", ...)
+    parser.add_argument("--interval", type=int, default=5, ...)
+    args = parser.parse_args()
+
+    email, password = resolve_worker_credentials(args, parser)
+
+    run_worker(api=args.api, email=email, password=password,
+               max_chunks=args.max_chunks, interval=args.interval)
+```
+
+`run_worker`, `login`, `claim_chunks`, `submit_result`, `process_chunk` no cambian de firma por esta decisión (solo cambia cómo `main()` obtiene `email`/`password`).
+
+#### 15.2.3 Cambios en `backend/app/worker/run_workers.sh`
+
+Eliminar el valor por defecto inseguro `password123` y dejar de pasar `--password` en la invocación (pasa a heredarse del entorno del proceso):
+
+```bash
+# Antes: PASSWORD="${WORKER_PASSWORD:-password123}"  y  --password "$PASSWORD"
+# Después:
+: "${CC_WORKER_PASSWORD:?Debes definir CC_WORKER_PASSWORD antes de ejecutar este script}"
+export CC_WORKER_EMAIL="${EMAIL}"      # dentro del bucle, por cada worker
+export CC_WORKER_PASSWORD             # ya viene del entorno, se re-exporta explícitamente por claridad
+
+python -m app.worker \
+    --api "$API" \
+    --max-chunks "$MAX_CHUNKS" \
+    --interval "$INTERVAL" \
+    &
+```
+
+`: "${VAR:?mensaje}"` es el idioma estándar de `bash` para fallar rápido con un mensaje legible si la variable no está definida — evita reintroducir un default inseguro por comodidad de demo.
+
+### 15.3 Decisión 3 — Aislamiento de proceso del worker (primer paso, no sandboxing completo)
+
+#### 15.3.1 Alcance decidido para este ciclo
+
+**Se implementa: ejecutar `plugin.process(payload)` en un subproceso Python separado (`multiprocessing`), con límite de CPU, límite de memoria (vía el módulo estándar `resource`, POSIX) y un timeout duro de pared por chunk.** No se implementa contenedores por chunk, seccomp/AppArmor, ni aislamiento de red — eso queda explícitamente para un ciclo posterior (ver §15.3.5).
+
+**Por qué este alcance y no el completo, ahora:** el propio SEC-29 evalúa el riesgo actual como bajo (el plugin `data_processing` no usa `eval`/`exec`/`subprocess`, solo procesa listas de valores primitivos con `polars`/stdlib) pero señala dos vectores reales incluso hoy: (1) un payload patológico (filas/columnas masivas, valores que disparan un bug de consumo de memoria en `polars`) puede colgar o tumbar por OOM el **proceso worker completo**, perdiendo todo el trabajo en curso de ese worker, no solo el chunk problemático; (2) el sistema de plugins está diseñado para extensibilidad, y un futuro plugin que invoque herramientas externas (`ffmpeg`, etc.) sin este aislamiento sería un vector de RCE mucho más serio. Aislar por subproceso, con límites y timeout, resuelve (1) por completo hoy (el proceso worker principal sobrevive a cualquier chunk que se cuelgue, agote memoria o crashee) y establece el patrón de contención que cualquier plugin futuro heredará automáticamente sin cambios — sin requerir Docker, sin cambiar la infraestructura de despliegue del worker (sigue siendo `python -m app.worker` en el mismo host/proceso que hoy).
+
+#### 15.3.2 Nuevo módulo `backend/app/worker/sandbox.py`
+
+```python
+"""
+Aislamiento de proceso para el cómputo de un chunk (primer paso — ver
+docs/04-arquitectura.md §15.3). Ejecuta plugin.process(payload) en un
+subproceso separado con límites de CPU/memoria y timeout duro, para que
+un payload patológico no pueda colgar ni tumbar el proceso worker principal.
+
+NO es sandboxing completo: no hay aislamiento de red, filesystem ni
+namespaces de SO. Ver §15.3.5 para el alcance que queda deliberadamente
+fuera de este ciclo (contenedores con seccomp/AppArmor).
+"""
+import logging
+import multiprocessing as mp
+import sys
+import time
+from typing import Any
+
+logger = logging.getLogger("worker")
+
+CHUNK_TIMEOUT_SECONDS = 30      # timeout duro de pared por chunk
+CHUNK_CPU_LIMIT_SECONDS = 25    # límite de tiempo de CPU (RLIMIT_CPU), algo por debajo del timeout de pared
+CHUNK_MEMORY_LIMIT_MB = 512     # límite de memoria virtual (RLIMIT_AS) del subproceso
+
+
+def _child_entrypoint(job_type: str, payload: dict, result_queue: "mp.Queue[dict]") -> None:
+    """Punto de entrada del subproceso hijo. Aplica límites de recursos (si el SO los soporta) y ejecuta el plugin."""
+    if sys.platform != "win32":
+        # El módulo `resource` es POSIX-only. En Windows (solo relevante para
+        # desarrollo local, no para el despliegue en `deploy/backend.Dockerfile`,
+        # que es Linux) se omiten los límites de CPU/memoria y solo queda el
+        # timeout de pared (§15.3.4).
+        import resource
+        resource.setrlimit(resource.RLIMIT_CPU, (CHUNK_CPU_LIMIT_SECONDS, CHUNK_CPU_LIMIT_SECONDS))
+        mem_bytes = CHUNK_MEMORY_LIMIT_MB * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
+
+    from app.worker.plugins import get_plugin  # import diferido: solo necesario en el hijo
+
+    try:
+        plugin = get_plugin(job_type)
+        if plugin is None:
+            result_queue.put({"ok": False, "error": f"unsupported job_type: {job_type}"})
+            return
+        result = plugin.process(payload)
+        result_queue.put({"ok": True, "result": result})
+    except MemoryError:
+        result_queue.put({"ok": False, "error": "chunk excedió el límite de memoria del subproceso"})
+    except Exception as exc:
+        result_queue.put({"ok": False, "error": str(exc)})
+
+
+def run_chunk_sandboxed(job_type: str, payload: dict[str, Any]) -> tuple[dict, int]:
+    """
+    Ejecuta el procesamiento de un chunk en un subproceso aislado.
+    Devuelve (result_dict, duration_ms) — misma forma que la función
+    `process_chunk` que sustituye en `worker/main.py`.
+    """
+    ctx = mp.get_context("spawn")  # spawn (no fork): el hijo no hereda estado del padre
+    result_queue: "mp.Queue[dict]" = ctx.Queue()
+    start = time.monotonic()
+
+    proc = ctx.Process(target=_child_entrypoint, args=(job_type, payload, result_queue))
+    proc.start()
+    proc.join(timeout=CHUNK_TIMEOUT_SECONDS)
+    elapsed_ms = max(1, int((time.monotonic() - start) * 1000))
+
+    if proc.is_alive():
+        logger.error("Chunk excedió el timeout de %ds — terminando subproceso", CHUNK_TIMEOUT_SECONDS)
+        proc.terminate()
+        proc.join(timeout=2)
+        if proc.is_alive():
+            proc.kill()
+            proc.join()
+        return {"error": f"chunk processing timed out after {CHUNK_TIMEOUT_SECONDS}s"}, elapsed_ms
+
+    if proc.exitcode != 0:
+        # Terminado por señal (OOM/RLIMIT → SIGKILL/SIGSEGV) o excepción no capturada en el hijo.
+        logger.error("Subproceso del chunk terminó con código anómalo: %s", proc.exitcode)
+        return {"error": f"chunk process exited abnormally (code={proc.exitcode})"}, elapsed_ms
+
+    try:
+        outcome = result_queue.get_nowait()
+    except Exception:
+        return {"error": "chunk process produced no result"}, elapsed_ms
+
+    if not outcome.get("ok"):
+        return {"error": outcome.get("error", "unknown error")}, elapsed_ms
+    return outcome["result"], elapsed_ms
+```
+
+#### 15.3.3 Integración en `backend/app/worker/main.py`
+
+`process_chunk(chunk: dict) -> tuple[dict, int]` conserva su firma externa (usada por `run_worker`); su cuerpo delega en el sandbox:
+
+```python
+from app.worker.sandbox import run_chunk_sandboxed
+
+def process_chunk(chunk: dict) -> tuple[dict, int]:
+    job_type = chunk.get("job_type", "data-processing")
+    payload = chunk.get("payload", {})
+    return run_chunk_sandboxed(job_type, payload)
+```
+
+El manejo de errores que hoy vive en `process_chunk` (try/except alrededor de `plugin.process`) se traslada al `_child_entrypoint` del sandbox (§15.3.2) — mismo resultado observable para el llamador (`{"error": "..."}` en vez de una excepción propagada), ahora también cubriendo timeout y agotamiento de recursos, que antes no tenían ningún manejo.
+
+#### 15.3.4 Justificación de los límites elegidos
+
+- **Timeout de pared 30s:** los chunks son de ~500 filas (`CHUNK_SIZE` en `compute_service.py`) con operaciones agregadas simples (`mean`/`sum`/`min`/`max`/`count`) — deberían completarse en milisegundos. 30s da margen amplio para entornos con hardware modesto sin dejar un chunk problemático bloqueado indefinidamente.
+- **CPU 25s (por debajo del timeout de pared):** existe para que un proceso que consuma CPU intensivamente (sin bloquear en I/O) se autolimite por `SIGXCPU` un poco antes de que el timeout de pared lo mate de todas formas — señal más específica en logs (código de salida distinto) para diagnosticar "consumió demasiada CPU" vs. "se quedó colgado en I/O/espera".
+- **Memoria 512 MB:** margen razonable para un DataFrame de polars de 500 filas incluso con columnas anchas; muy por debajo de lo que haría falta para que un chunk legítimo lo alcance, pero suficiente para contener un payload que intente forzar una asignación de memoria patológica.
+
+Estas tres constantes son válidas para el plugin `data_processing` actual. **Un futuro plugin con requisitos distintos (p. ej. procesamiento de vídeo) necesitará sus propios límites** — se deja como nota para quien añada el siguiente plugin, no se generaliza a un mecanismo de configuración por `job_type` en este ciclo (YAGNI hasta que exista un segundo plugin real).
+
+#### 15.3.5 Qué queda explícitamente fuera de este ciclo
+
+**Sandboxing completo (contenedor por worker o por chunk con seccomp/AppArmor, sin acceso a red saliente excepto a la API, filesystem de solo lectura) se deja fuera, deliberadamente, como siguiente paso — no como parte de este diseño.** Razón: es un cambio de infraestructura de despliegue significativo (empaquetar y orquestar un contenedor por chunk, o un daemon de contenedores de larga duración con un perfil seccomp mantenido), que no es necesario mientras el único plugin real (`data_processing`) no invoque procesos externos ni acceda a red/filesystem más allá de lo que ya hace `polars` en memoria. El aislamiento por subproceso de este ciclo ya cierra el vector de riesgo más probable hoy (payload que cuelga o agota memoria) sin ese coste. **Recomendación explícita: revisar este alcance de nuevo, esta vez sí con contenedores, en el momento en que se añada el primer plugin que invoque un binario externo (`ffmpeg`, `blender`, etc.)** — ese es el punto en el que el riesgo pasa de "crash/DoS local" a "RCE potencial", tal como ya anticipa SEC-29.
+
+#### 15.3.6 Nota de portabilidad
+
+El módulo `resource` de la librería estándar es POSIX-only (no existe en Windows). El entorno de despliegue real (`deploy/backend.Dockerfile`, `python:3.12-slim`) es Linux, donde `resource` está disponible sin condiciones. El guard `if sys.platform != "win32"` en `_child_entrypoint` (§15.3.2) es solo para que el worker siga siendo ejecutable en desarrollo local sobre Windows (entorno real de este equipo) sin fallar por `ImportError` — en ese caso el timeout de pared (`proc.join(timeout=...)`, multiplataforma) sigue aplicando igualmente; solo se pierden los límites de CPU/memoria específicos del proceso hijo en desarrollo local sobre Windows, no en producción.
+
+### 15.4 Decisión 4 — Mitigación básica de Sybil en `POST /auth/register` (sin servicio de email)
+
+#### 15.4.1 Qué se diseña ahora
+
+Dos medidas que **no requieren ningún servicio externo nuevo**, reutilizando el mecanismo de §15.1:
+
+1. **Rate limiting por IP en `POST /auth/register`:** ya especificado en §15.1.1 (`5 peticiones / hora / IP`) y §15.1.4 (misma dependencia `rate_limit_by_ip`, reutilizada sin código adicional). Encarece — no elimina — la creación masiva de cuentas desde un mismo origen: un atacante con una sola IP tarda al menos una hora en crear más de 5 cuentas; con IPs rotadas (proxies, VPN, red residencial de bajo coste) el límite no aplica, igual que cualquier rate limit por IP.
+
+2. **Validación de formato de email más estricta**, en `app/models/auth.py`, adicional al `EmailStr` de Pydantic que ya está en uso (que valida sintaxis RFC pero no mucho más):
+
+```python
+# app/models/auth.py — RegisterRequest, nuevo field_validator
+import re
+
+_CONSECUTIVE_DOTS = re.compile(r"\.\.")
+
+class RegisterRequest(BaseModel):
+    full_name: str = Field(..., min_length=1, max_length=100)
+    email: EmailStr
+    password: str = Field(..., min_length=8, ...)
+
+    @field_validator("email")
+    @classmethod
+    def email_format_strict(cls, v: str) -> str:
+        local_part = v.split("@", 1)[0]
+        if _CONSECUTIVE_DOTS.search(v):
+            raise ValueError("El email no puede contener puntos consecutivos")
+        if len(local_part) > 64:
+            raise ValueError("La parte local del email es demasiado larga")
+        return v.lower()  # normaliza mayúsculas/minúsculas antes de comprobar duplicados
+    ...
+```
+
+**Normalización a minúsculas (`v.lower()`) es el cambio con más impacto real aquí, no la validación de puntos**: hoy `get_provider_by_email` compara el email tal cual llega, así que `Ana@Example.com` y `ana@example.com` se tratan como cuentas distintas — una forma trivial de evadir el propio límite de "una cuenta por email" sin ni siquiera necesitar Sybil. Normalizar a minúsculas en el modelo, antes de que llegue a la capa de servicio, cierra esa brecha concreta sin tocar `auth_queries.py`.
+
+**Heurística opcional, NO incluida por defecto en este ciclo (se documenta, se deja a criterio de Backend Dev/PO activarla):** normalizar direcciones `local+tag@dominio` a `local@dominio` únicamente a efectos de la comprobación de unicidad (Gmail y otros proveedores ignoran todo lo posterior a `+` en la entrega, permitiendo registrar `n` cuentas con `user+1@gmail.com` ... `user+n@gmail.com` que llegan al mismo buzón). Se deja fuera del diseño obligatorio de este ciclo porque es más agresiva (rechaza patrones de email que son válidos y legítimos para otros usos) y su beneficio real depende de qué proporción de proveedores de email de los usuarios reales soporta plus-addressing — juicio de producto, no puramente técnico.
+
+#### 15.4.2 Qué se deja explícitamente fuera — requiere decisión y cuenta externa del usuario
+
+**Verificación de email (envío de correo de confirmación con enlace/código antes de activar la cuenta) es la mitigación recomendada a largo plazo para Sybil a nivel de registro, y no se diseña en este ciclo.** Requiere un servicio de email transaccional (SendGrid, AWS SES, Postmark, Resend, o equivalente) que este proyecto no tiene contratado — igual que Vercel/Railway/Supabase requirieron en su momento que el usuario abriera cuenta y las conectara. Esto queda fuera de este ciclo explícitamente como pendiente de decisión del usuario (qué proveedor, qué cuenta, qué presupuesto) antes de que se pueda diseñar en detalle.
+
+#### 15.4.3 Honestidad sobre el alcance real de esta mitigación
+
+**Esto no resuelve Sybil de fondo — reduce el abuso más torpe.** Un atacante con más de una IP disponible (proxies gratuitos, VPN, tethering móvil con reasignación de IP) no encuentra ninguna fricción real en el rate limit de registro; y aunque el registro estuviera perfectamente protegido, el problema de fondo que describe SEC-23 (dos cuentas distintas controladas por la misma persona, validándose mutuamente en el consenso de `/work/{chunk_id}/submit`) **sigue exactamente igual de vigente** — esa mitigación queda fuera de alcance de este ciclo tal como especifica el encargo original ("valora si aplica también a otros endpoints", no "resuelve SEC-23"). Este ciclo cierra específicamente la puerta más barata de abrir (creación de cuentas ilimitada y gratuita desde un único origen, sin ninguna fricción), no el problema de identidad de fondo. Se recomienda que SEC-23 se aborde en un ciclo dedicado, con las alternativas ya discutidas en `docs/06-security.md` (fingerprint de hardware declarado, proof-of-work, verificación de identidad más fuerte) una vez que el Product Owner decida cuánto esfuerzo de ingeniería justifica el riesgo residual.
+
+### 15.5 Qué NO se diseña en este ciclo — resumen explícito
+
+| Elemento | Por qué queda fuera | Acción requerida |
+|---|---|---|
+| Redis / almacén compartido dedicado para rate limiting | El proyecto no lo tiene; Postgres ya cubre la necesidad actual sin dependencia nueva | Ninguna ahora; revisar si el volumen de tráfico hace que el round-trip a Postgres sea un cuello de botella real |
+| Sandboxing completo del worker (contenedor + seccomp/AppArmor + red restringida) | Cambio de infraestructura de despliegue significativo, no justificado mientras el único plugin no invoque procesos externos | Revisar al añadir el primer plugin que invoque un binario externo (§15.3.5) |
+| Verificación de email en registro | Requiere servicio externo de email transaccional no contratado | **Decisión y cuenta externa del usuario** (SendGrid/SES/Postmark/Resend), fuera de este ciclo |
+| Solución de fondo a Sybil en consenso (SEC-23) | Requiere rediseño del protocolo de identidad de worker (fingerprint, proof-of-work, etc.), esfuerzo mayor y fuera del alcance de este encargo | Ciclo dedicado futuro, con criterio explícito del Product Owner sobre esfuerzo vs. riesgo residual |
+
+### 15.6 Handoff — Database Engineer
+
+1. Crear y ejecutar **`migrations/008_rate_limiting.sql`** (contenido exacto en §15.1.2): tabla `rate_limit_counters (bucket text, window_start timestamptz, request_count integer)` con `PRIMARY KEY (bucket, window_start)`. Idempotente (`CREATE TABLE IF NOT EXISTS`), mismo estilo que `006_chunk_ttl.sql`/`007_chunk_abandon_tracking.sql`.
+2. No requiere RLS ni políticas nuevas (acceso exclusivo vía psycopg2 directo, no vía SDK REST — mismo patrón que `chunks`/`jobs` para operaciones atómicas).
+3. No se requiere ninguna migración para las Decisiones 2 y 3 (credenciales de worker, sandboxing) — son cambios de código de aplicación puros, sin esquema.
+4. Confirmar que `SUPABASE_DB_URL` sigue siendo la variable de pool (puerto 6543) ya usada para el resto de operaciones psycopg2 — no se introduce ninguna variable de entorno nueva de base de datos.
+
+### 15.7 Handoff — Backend Dev
+
+**Decisión 1 (rate limiting):**
+1. Crear `app/core/rate_limit.py` según §15.1.3 (`check_rate_limit`, `rate_limit_by_ip`, `rate_limit_by_provider`).
+2. `app/routers/auth.py`: añadir `dependencies=[Depends(rate_limit_by_ip("register", limit=5, window_seconds=3600))]` a `POST /register` y `dependencies=[Depends(rate_limit_by_ip("login", limit=10, window_seconds=60))]` a `POST /login` (§15.1.4).
+3. `app/routers/work.py`: sustituir `Depends(get_current_provider)` por `Depends(rate_limit_by_provider("work_claim", limit=30, window_seconds=60))` en `POST /claim`, y por `Depends(rate_limit_by_provider("work_submit", limit=60, window_seconds=60))` en `POST /{chunk_id}/submit` (§15.1.4). El resto del cuerpo de ambos endpoints no cambia.
+
+**Decisión 2 (credenciales del worker):**
+4. `app/worker/main.py`: añadir `resolve_worker_credentials()` (§15.2.2); cambiar `--email`/`--password` a opcionales con warning de deprecación si se usan sin la variable de entorno equivalente.
+5. `app/worker/run_workers.sh`: eliminar el default `password123`, exigir `CC_WORKER_PASSWORD` del entorno con `: "${CC_WORKER_PASSWORD:?...}"`, dejar de pasar `--password` (§15.2.3).
+6. Documentar `CC_WORKER_EMAIL`/`CC_WORKER_PASSWORD` en cualquier README/guía de arranque del worker que exista.
+
+**Decisión 3 (sandboxing worker):**
+7. Crear `app/worker/sandbox.py` según §15.3.2 (`run_chunk_sandboxed`, `_child_entrypoint`, constantes `CHUNK_TIMEOUT_SECONDS=30`, `CHUNK_CPU_LIMIT_SECONDS=25`, `CHUNK_MEMORY_LIMIT_MB=512`).
+8. `app/worker/main.py`: reescribir `process_chunk()` para delegar en `run_chunk_sandboxed()` (§15.3.3).
+
+**Decisión 4 (Sybil en registro):**
+9. `app/models/auth.py`: añadir `field_validator` de email en `RegisterRequest` (§15.4.1) — normaliza a minúsculas y rechaza puntos consecutivos / parte local excesivamente larga.
+10. El rate limit de `/auth/register` ya queda cubierto por el punto 2 (mismo mecanismo, no requiere trabajo adicional).
+
+### 15.8 Impacto en tests existentes (para QA / Backend Dev)
+
+- **`backend/tests/test_auth.py`:** los tests de `register`/`login` que usan `TestClient` sin mockear `psycopg2` empezarán a golpear la tabla `rate_limit_counters` real si corren contra una base de datos de test — si los tests actuales mockean toda la capa de queries (patrón documentado en §9.1, `unittest.mock.patch` sobre `app/db/queries/`), **la nueva dependencia de rate limiting no está mockeada por ese patrón** porque vive en `app/core/rate_limit.py`, no en `app/db/queries/`. Backend Dev debe añadir un mock o fixture (`app.dependency_overrides` sobre `rate_limit_by_ip`/`rate_limit_by_provider`, mismo mecanismo ya usado para `get_current_provider` en `conftest.py`) para que los tests existentes no empiecen a fallar por 429 al ejecutar varias peticiones seguidas en el mismo test.
+- **`backend/tests/test_compute.py` / futuros tests de `/work/claim` y `/work/submit`:** mismo problema — cualquier test que haga más de `limit` peticiones seguidas al mismo endpoint dentro de la ventana necesita el mismo override de dependencia.
+- **Worker (`app/worker/`):** no hay tests unitarios del worker en el árbol actual (confirmado por `docs/04-estructura.md`, sección de tests de `backend/tests/`) — no hay nada que romper por las Decisiones 2 y 3, pero se recomienda añadir al menos un test de `resolve_worker_credentials()` (prioridad de env var sobre CLI, error si faltan ambas) y uno de `run_chunk_sandboxed()` (timeout real con un plugin que duerma más de `CHUNK_TIMEOUT_SECONDS`, usando un timeout de test reducido vía monkeypatch de la constante).
